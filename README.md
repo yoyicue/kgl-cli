@@ -37,6 +37,11 @@ kgl put local remote                # upload (auto-mkdir parents)
 ```
 
 - Multiple sessions: `kgl bootstrap "Tesla"` or `kgl bootstrap 367184647` — refuses to guess.
+- `kgl session stop|run-all|save` needs: a chrome/chromium binary (macOS/Linux
+  common paths auto-detected) and `echo owner/slug > ~/.config/kgl/notebook`.
+  These actions drive the Kaggle editor in an isolated headless chrome
+  (ephemeral profile, auto-allocated CDP port) and verify the outcome
+  server-side before exiting (exit 0 = verified).
 - Cookie refresh: re-login to kaggle in any chrome with `--remote-debugging-port=9222`;
   `kgl bootstrap` picks them up and caches (verified against the API first).
 - `kgl term` is unsupported: Kaggle blocks the terminado websocket. Use `sh`/`exec`.

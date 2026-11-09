@@ -485,29 +485,50 @@ def run_code(code, timeout=600, kernel_id=None):
     return 124
 
 
-def _headless_action(action, wait=30):
+_CHROMES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome", "/usr/bin/chromium-browser", "/usr/bin/chromium",
+]
+
+
+def _chrome_bin():
+    for c in _CHROMES:
+        if os.access(c, os.X_OK):
+            return c
+    sys.exit("no chrome/chromium found; edit _CHROMES in kgl")
+
+
+def _headless_action(action, wait=30, timeout=120):
     """Drive the Kaggle editor in headless chrome for browser-gated actions
     (stop / run-all / save — their RPCs 403 outside a browser context).
-    LARGE viewport required: session controls are hidden below ~1280px."""
-    import subprocess, tempfile, websocket
+    Returns 0 on VERIFIED success, 1 on failure. Large viewport required:
+    session controls are hidden below ~1280px."""
+    import subprocess, tempfile, shutil, websocket
     cookies = _cookie_store()
+    slug = _notebook_slug()
+    profile = tempfile.mkdtemp(prefix="kgl-chrome-")
     proc = subprocess.Popen(
-        ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-         "--headless=new", "--remote-debugging-port=9223",
-         "--user-data-dir=/tmp/chrome-kaggle-headless",
-         "--no-first-run", "--disable-gpu", "--window-size=1920,1080"],
+        [_chrome_bin(), "--headless=new", "--remote-debugging-port=0",
+         f"--user-data-dir={profile}", "--no-first-run", "--disable-gpu",
+         "--window-size=1920,1080"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        for _ in range(10):
-            try:
-                ver = json.loads(subprocess.check_output(
-                    ["curl", "-s", "--noproxy", "*", "-m", "2",
-                     "http://localhost:9223/json/version"]))
+        # port 0 -> chrome picks a free one and writes it to DevToolsActivePort
+        port = None
+        for _ in range(20):
+            f = os.path.join(profile, "DevToolsActivePort")
+            if os.path.exists(f):
+                port = int(open(f).read().split()[0])
                 break
-            except Exception:
-                time.sleep(0.5)
-        else:
-            sys.exit("headless chrome did not start")
+            time.sleep(0.5)
+        if not port:
+            sys.exit("headless chrome did not start (no DevToolsActivePort)")
+        ver = json.loads(subprocess.check_output(
+            ["curl", "-s", "--noproxy", "*", "-m", "3",
+             f"http://localhost:{port}/json/version"]))
+        if "Chrome" not in ver.get("Browser", "") and "Chromium" not in ver.get("Browser", ""):
+            sys.exit(f"unexpected CDP endpoint: {ver.get('Browser')}")
         ws = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=20,
                                          suppress_origin=True)
         ws.send(json.dumps({"id": 1, "method": "Storage.setCookies",
@@ -519,13 +540,26 @@ def _headless_action(action, wait=30):
                     break
             except websocket.WebSocketTimeoutException:
                 continue
-        subprocess.run(["curl", "-s", "-X", "PUT",
-            "http://localhost:9223/json/new?https://www.kaggle.com/code/"
-            + _notebook_slug() + "/edit"], capture_output=True)
+        # create the tab and capture ITS id — never operate an unrelated tab
+        tab = json.loads(subprocess.check_output(
+            ["curl", "-s", "--noproxy", "*", "-m", "10", "-X", "PUT",
+             f"http://localhost:{port}/json/new?https://www.kaggle.com/code/{slug}/edit"]))
+        tab_id = tab["id"]
         time.sleep(wait)
 
+        def find_tab_ws():
+            tabs = json.loads(subprocess.check_output(
+                ["curl", "-s", "--noproxy", "*", f"http://localhost:{port}/json/list"]))
+            for t in tabs:
+                if t.get("id") == tab_id and slug.split("/")[-1] in t.get("url", ""):
+                    return websocket.create_connection(t["webSocketDebuggerUrl"],
+                                                       timeout=30, suppress_origin=True)
+            return None
+
         def click(expr):
-            pws = _edit_tab_ws()
+            pws = find_tab_ws()
+            if not pws:
+                return "tab-lost"
             pws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
                                  "params": {"expression": expr, "returnByValue": True}}))
             t0 = time.time()
@@ -537,21 +571,48 @@ def _headless_action(action, wait=30):
                 if m.get("id") == 1:
                     pws.close()
                     return m["result"]["result"].get("value")
-            return None
+            return "no-response"
+
+        def sessions_now():
+            d = _kgl_cookie_api("ListKernelSessions", {})
+            return {s["kernelRunId"] for s in (d or {}).get("sessions", [])}
 
         if action == "stop":
+            before = sessions_now()
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>(b.getAttribute('aria-label')||'')==='Stop session');"
                       "if(!b) return 'no-stop-btn'; b.click(); return 'stop-clicked';})()")
-            print(r or "no response")
-            return
+            print(r)
+            if "clicked" not in str(r):
+                return 1
+            t0 = time.time()  # verify server-side teardown
+            while time.time() - t0 < timeout:
+                if not (sessions_now() & before):
+                    print("stopped (verified)")
+                    return 0
+                time.sleep(8)
+            print(f"stop not confirmed within {timeout}s", file=sys.stderr)
+            return 1
         if action == "run-all":
+            before = sessions_now()
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>/Run All/i.test(b.getAttribute('aria-label')||b.innerText));"
                       "if(!b) return 'no-runall'; b.click(); return 'runall-clicked';})()")
-            print(r or "no response")
-            return
+            print(r)
+            if "clicked" not in str(r):
+                return 1
+            t0 = time.time()  # verify a session actually spins up
+            while time.time() - t0 < timeout:
+                if sessions_now() - before:
+                    print("session started (verified)")
+                    return 0
+                time.sleep(10)
+            print(f"no new session within {timeout}s", file=sys.stderr)
+            return 1
         if action == "save":
+            CK = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+            before = len((_kgl_cookie_api("ListKernelVersions",
+                         {"kernelId": _notebook_kernel_id()}) or {}).get("items", []))
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>/Save Version/.test(b.innerText));"
                       "if(!b) return 'no-save'; b.click(); return 'sv-clicked';})()")
@@ -561,10 +622,60 @@ def _headless_action(action, wait=30):
                        "if(!bs.length) return 'no-confirm'; bs[bs.length-1].click();"
                        "return 'saved';})()")
             print(r, "/", r2)
-            return
+            if "saved" not in str(r2):
+                return 1
+            t0 = time.time()  # verify a new version lands server-side
+            while time.time() - t0 < timeout:
+                d = _kgl_cookie_api("ListKernelVersions", {"kernelId": _notebook_kernel_id()}) or {}
+                if len(d.get("items", [])) > before:
+                    print("version saved (verified)")
+                    return 0
+                time.sleep(10)
+            print(f"save not confirmed within {timeout}s", file=sys.stderr)
+            return 1
         sys.exit(f"unknown action {action}")
     finally:
         proc.terminate()
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def _kgl_cookie_api(method, body):
+    """kaggle RPC with cached cookies; None on failure (verification polls)."""
+    try:
+        cookies = _cookie_store()
+        CK = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+        xsrf = [p.split("=", 1)[1] for p in CK.split("; ")
+                if p.startswith("XSRF-TOKEN=")]
+        if not xsrf:
+            return None
+        out = subprocess.check_output(
+            ["curl", "-s", "--noproxy", "*", "-m", "15",
+             f"https://www.kaggle.com/api/i/kernels.KernelsService/{method}",
+             "-H", "content-type: application/json",
+             "-H", f"x-xsrf-token: {xsrf[0]}", "-b", CK,
+             "-d", json.dumps(body)]).decode()
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def _notebook_kernel_id():
+    """kernelId for the configured notebook, resolved from the live session
+    (ListKernelSessions items carry kernelId) and cached."""
+    cache = os.path.join(CONFDIR, "kernel_id")
+    if os.path.exists(cache):
+        v = open(cache).read().strip()
+        if v:
+            return int(v)
+    d = _kgl_cookie_api("ListKernelSessions", {}) or {}
+    ss = d.get("sessions", [])
+    if not ss:
+        sys.exit("no running session to resolve kernelId; run `kgl session run-all` first")
+    if len({s["kernelId"] for s in ss}) > 1:
+        sys.exit("multiple notebooks have sessions; echo <id> > ~/.config/kgl/kernel_id")
+    kid = ss[0]["kernelId"]
+    _secure_write(cache, str(kid) + "\n")
+    return kid
 
 
 def _notebook_slug():
@@ -574,17 +685,6 @@ def _notebook_slug():
         if slug:
             return slug
     sys.exit("no notebook configured: echo owner/slug > ~/.config/kgl/notebook")
-
-
-def _edit_tab_ws():
-    import websocket
-    tabs = json.loads(subprocess.check_output(
-        ["curl", "-s", "--noproxy", "*", "http://localhost:9223/json/list"]))
-    tab = next((t for t in tabs if t["type"] == "page" and "kaggle.com" in t["url"]), None)
-    if not tab:
-        sys.exit("edit page did not open (cookies expired? login again)")
-    return websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=30,
-                                       suppress_origin=True)
 
 
 def main():
@@ -612,7 +712,7 @@ def main():
     if cmd == "session":
         if len(sys.argv) < 3 or sys.argv[2] not in ("stop", "run-all", "save"):
             sys.exit("usage: kgl session stop|run-all|save")
-        return _headless_action(sys.argv[2])
+        return sys.exit(_headless_action(sys.argv[2]))
     if cmd == "status":
         print(json.dumps(api("api/kernels"), indent=1))
         print("terminals:", json.dumps(api("api/terminals")))
