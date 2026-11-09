@@ -1,4 +1,6 @@
-# kgl
+# kgl-cli
+
+> **Unofficial** — uses Kaggle's internal (reverse-engineered) APIs. Not affiliated with Kaggle/Google; could break anytime; respect their ToS and GPU quotas.
 
 Control a running Kaggle notebook sandbox (Jupyter) from your local terminal — pure HTTP, no browser required after initial login.
 
@@ -44,11 +46,23 @@ kgl put local remote                # upload (auto-mkdir parents)
 `notebook` (last slug). Credentials are passed to curl via 0600 config files
 and stdin, never argv.
 
+## How the route mint was found
+
+Short version: the editor page passes a proxy URL (with an encrypted token)
+down to its JupyterLab iframe; that URL actually lives in a Firestore document
+(`sessions/<doc>/data/JupyterURL`), reachable after a three-step auth chain.
+`kgl bootstrap` replays that chain with plain HTTP calls. See git history for
+the full adventure.
+
 ## Test
 
 ```bash
 python3 test_kgl.py   # offline unit tests (no network, mocks curl)
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Known limits
 
