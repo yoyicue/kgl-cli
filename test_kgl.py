@@ -805,6 +805,66 @@ def t_fetch_json_error_body():
 t_fetch_json_error_body()
 
 
+# --- _nb_max_exec ------------------------------------------------------------
+def t_nb_max_exec():
+    nb = {"cells": [
+        {"cell_type": "code", "execution_count": 3},
+        {"cell_type": "code", "execution_count": None},
+        {"cell_type": "markdown"},  # ignored
+        {"cell_type": "code", "execution_count": 7}]}
+    check("max exec count", kgl._nb_max_exec(nb) == 7)
+    check("no cells -> 0", kgl._nb_max_exec({"cells": []}) == 0)
+    check("non-dict -> 0", kgl._nb_max_exec(None) == 0)
+    check("null counts -> 0", kgl._nb_max_exec(
+        {"cells": [{"cell_type": "code", "execution_count": None}]}) == 0)
+
+
+t_nb_max_exec()
+
+
+# --- cache: foreign confirmed on RETRY -> dropped once, re-resolves (no crash)
+def t_cache_retry_mismatch():
+    orig_slug, orig_api = kgl._notebook_slug, kgl._kgl_cookie_api
+    kgl._notebook_slug = lambda: "owner/target"
+    cache = os.path.join(kgl.CONFDIR, "kernel_id")
+    state = {"n": 0}
+    def flaky(m, b):
+        state["n"] += 1
+        if m == "GetKernel":
+            return (False, None) if state["n"] == 1 else (True, {"url": "/code/x/ELSE"})
+        return (True, {"sessions": [{"kernelId": 77, "kernelRunId": 9}]})
+    # second GetKernel (retry) says foreign; session list resolves 77 via GetKernel...
+    # keep it simple: after drop, resolution calls GetKernel(77) -> our notebook
+    def flaky2(m, b):
+        state["n"] += 1
+        if b.get("kernelId") == 42:
+            return (False, None) if state["n"] == 1 else (True, {"url": "/code/x/ELSE"})
+        return (True, {"url": "/code/owner/target"})
+    def sessions_api(m, b):
+        if m == "ListKernelSessions":
+            return (True, {"sessions": [{"kernelId": 77, "kernelRunId": 9}]})
+        return flaky2(m, b)
+    kgl._kgl_cookie_api = sessions_api
+    real_sleep = kgl.time.sleep
+    kgl.time = types.SimpleNamespace(time=kgl.time.time,
+        strftime=kgl.time.strftime, sleep=lambda s: None)
+    try:
+        kgl._secure_write(cache, "owner/target 42\n")
+        kid = kgl._notebook_kernel_id(required=False)
+        check("retry-confirmed foreign dropped, re-resolved", kid == 77, str(kid))
+        check("cache rewritten with correct kid",
+              open(cache).read().strip() == "owner/target 77")
+    finally:
+        kgl._notebook_slug, kgl._kgl_cookie_api = orig_slug, orig_api
+        kgl.time = types.SimpleNamespace(time=kgl.time.time,
+            strftime=kgl.time.strftime, sleep=real_sleep)
+        if os.path.exists(cache):
+            os.unlink(cache)
+
+
+t_cache_retry_mismatch()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")

@@ -610,6 +610,19 @@ def _headless_action(action, wait=30, timeout=240):
             print(f"stop not confirmed within {timeout}s", file=sys.stderr)
             return 1
         if action == "run-all":
+            # pre-click baseline: max cell execution_count in the draft. A
+            # busy kernel alone proves nothing (it may have been busy before);
+            # success = THIS click's execution, i.e. counts moved or our poll
+            # catches the (idle ->) busy run.
+            baseline = None
+            try:
+                kid0 = _notebook_kernel_id(required=False)
+                if kid0:
+                    nb0 = _draft_notebook(kid0)
+                    if nb0 is not None:
+                        baseline = _nb_max_exec(nb0)
+            except SystemExit:
+                pass
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>/Run All/i.test(b.getAttribute('aria-label')||b.innerText));"
                       "if(!b) return 'no-runall'; b.click(); return 'runall-clicked';})()")
@@ -650,9 +663,20 @@ def _headless_action(action, wait=30, timeout=240):
                                 if k.get("id") == tgt and k.get("execution_state") == "busy":
                                     print(f"run-all executing (kernel {kid}, run {run_id})")
                                     return 0
-                                # ponytail: strict busy-only — last_activity can't
-                                # prove THIS click ran cells (other kernels' iopub
-                                # may touch timestamps); fast cells => honest rc 1
+                            if baseline is not None:
+                                # counts on the session's live notebook moved
+                                # past the pre-click draft baseline == cells
+                                # ran because of THIS click (fast cells too)
+                                _, cnb = _fetch_json(
+                                    f"{route}/api/contents/__notebook_source__.ipynb?content=1")
+                                live = ((cnb or {}).get("content")
+                                        if isinstance(cnb, dict) else None)
+                                if isinstance(live, dict) and _nb_max_exec(live) > baseline:
+                                    print(f"run-all executed (kernel {kid}, run {run_id}; "
+                                          "cells already completed)")
+                                    return 0
+                            # ponytail: with no baseline, busy-only — honest rc 1
+                            # for fast cells rather than trusting weak signals
                         except SystemExit:
                             pass  # route mint flaky; keep polling
                 time.sleep(3)
@@ -755,6 +779,26 @@ def _fetch_json(url):
         return int(code or 0), None
 
 
+def _nb_max_exec(nb):
+    """Max code-cell execution_count in a notebook dict (0 if none)."""
+    if not isinstance(nb, dict):
+        return 0
+    counts = [c.get("execution_count") or 0 for c in nb.get("cells", [])
+              if isinstance(c, dict) and c.get("cell_type") == "code"]
+    return max(counts) if counts else 0
+
+
+def _draft_notebook(kernel_id):
+    """The saved draft notebook (dict) or None — used as the pre-click
+    execution baseline; works even with no running session."""
+    ok, d = _kgl_cookie_api("GetOrCreateKernelSession", {"kernelId": kernel_id})
+    url = ((d or {}).get("draft", {}) or {}).get("blob", {}).get("sourceUrl")
+    if not ok or not url:
+        return None
+    _, nb = _fetch_json(url)
+    return nb if isinstance(nb, dict) else None
+
+
 def _iso(ts):
     """RFC3339 (2026-11-09T12:34:56.789Z) -> epoch seconds; 0 on garbage."""
     try:
@@ -784,26 +828,18 @@ def _notebook_kernel_id(required=True):
         if len(parts) == 2 and parts[0] == slug and parts[1].isdigit():
             kid = int(parts[1])
             ok, k = _kgl_cookie_api("GetKernel", {"kernelId": kid})
-            url = ((k or {}).get("url") or "").rstrip("/")
-            if ok and url == f"/code/{slug}":
-                return kid
-            if not ok:
-                # ownership UNKNOWN (API blip): retry once, then refuse to act
-                # on a possibly-stale cache rather than trusting it blind
+            if not ok:  # ownership UNKNOWN: one retry, then refuse (never trust blind)
                 time.sleep(3)
                 ok, k = _kgl_cookie_api("GetKernel", {"kernelId": kid})
-                url = ((k or {}).get("url") or "").rstrip("/")
-                if ok and url != f"/code/{slug}":
-                    os.unlink(cache)  # CONFIRMED foreign on retry
-                elif not ok:
-                    if required:
-                        sys.exit("cannot verify kernelId cache ownership (API "
-                                 "unavailable); retry when kaggle API recovers")
-                    return None  # lazy callers keep polling
-            if ok and url == f"/code/{slug}":
+            if not ok:
+                if required:
+                    sys.exit("cannot verify kernelId cache ownership (API "
+                             "unavailable); retry when kaggle API recovers")
+                return None  # lazy callers keep polling
+            url = ((k or {}).get("url") or "").rstrip("/")
+            if url == f"/code/{slug}":
                 return kid
-            if ok:
-                os.unlink(cache)  # CONFIRMED foreign — drop and re-resolve
+            os.unlink(cache)  # CONFIRMED foreign — drop (once) and re-resolve
     ok, d = _kgl_cookie_api("ListKernelSessions", {})
     if not ok or not isinstance(d, dict):
         if required:
