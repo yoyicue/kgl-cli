@@ -210,6 +210,74 @@ def t_post_json():
 t_post_json()
 
 
+# --- 6b. write-stage failure surfaces the ORIGINAL exception --------------
+def t_write_failure_exception():
+    real_dump = json.dump
+
+    def bad_dump(*a, **kw):
+        raise OSError("disk exploded")
+
+    # _post_json: header write fails -> OSError propagates, file cleaned
+    real_run = subprocess.run
+    subprocess.run = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": b"{}\n200"})()
+    before = set(os.listdir(tempfile.gettempdir()))
+    try:
+        import io
+        # make kf.write fail: patch tempfile.NamedTemporaryFile's returned file
+        real_ntf = tempfile.NamedTemporaryFile
+        class BoomFile:
+            name = ""
+            def __init__(self, *a, **kw):
+                self._f = real_ntf(*a, **kw)
+                BoomFile.name = self._f.name
+            def write(self, *a):
+                raise OSError("write failed")
+            def close(self):
+                self._f.close()
+        tempfile.NamedTemporaryFile = BoomFile
+        try:
+            kgl._post_json("https://x/", {}, {"cookie": "S"})
+            check("write failure propagates", False)
+        except OSError as e:
+            check("write failure propagates", "write failed" in str(e), str(e))
+        finally:
+            tempfile.NamedTemporaryFile = real_ntf
+            subprocess.run = real_run
+        after = set(os.listdir(tempfile.gettempdir()))
+        leaked = {f for f in after - before if f.endswith(".kgl")}
+        check("no .kgl left after write failure", not leaked, str(leaked))
+        if BoomFile.name and os.path.exists(BoomFile.name):
+            os.unlink(BoomFile.name)
+    finally:
+        json.dump = real_dump
+        subprocess.run = real_run
+
+
+t_write_failure_exception()
+
+
+# --- 6c. api(): json.dump failure leaves no body file -----------------------
+def t_api_dump_failure():
+    # obj whose serialization fails
+    class Bad:
+        def __init__(self):
+            self.x = 1
+    before = set(os.listdir(tempfile.gettempdir()))
+    try:
+        kgl.api("api/kernels", obj=Bad())  # unserializable -> TypeError from json.dump
+        check("dump failure propagates", False)
+    except TypeError:
+        check("dump failure propagates", True)
+    except Exception as e:
+        check("dump failure propagates", False, f"wrong exc {e!r}")
+    after = set(os.listdir(tempfile.gettempdir()))
+    leaked = {f for f in after - before if f.endswith(".json")}
+    check("no body file left after dump failure", not leaked, str(leaked))
+
+
+t_api_dump_failure()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")

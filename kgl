@@ -47,7 +47,10 @@ def curl(url, body=None, method=None):
         out, _, code = p.stdout.rpartition("\n")
         return int(code), out
     finally:
-        os.unlink(kf.name)
+        try:
+            os.unlink(kf.name)
+        except FileNotFoundError:
+            pass  # already removed by the write-stage handler
 
 
 def base():
@@ -69,13 +72,18 @@ def api(path, obj=None, method=None):
         if obj is not None:
             import tempfile
             f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-            json.dump(obj, f)
-            f.close()
-            body = f.name
+            body = f.name  # recorded before dump: cleanup covers dump failures
+            try:
+                json.dump(obj, f)
+            finally:
+                f.close()
         code, out = curl(f"{base()}/{path}", body, method)
     finally:
         if body:
-            os.unlink(body)
+            try:
+                os.unlink(body)
+            except FileNotFoundError:
+                pass
     if code >= 400:
         sys.exit(f"HTTP {code}: {out[:300]}")
     try:
@@ -184,7 +192,10 @@ def _post_json(url, body_obj, headers):
                 break
             time.sleep(1)
     finally:
-        os.unlink(kf.name)
+        try:
+            os.unlink(kf.name)
+        except FileNotFoundError:
+            pass  # already removed by the write-stage handler
     if p is None or p.returncode != 0:
         return 0, None
     out, _, code = p.stdout.decode().rpartition("\n")
@@ -292,7 +303,10 @@ def bootstrap(which=None):
                 break
             time.sleep(1)
     finally:
-        os.unlink(kf.name)
+        try:
+            os.unlink(kf.name)
+        except FileNotFoundError:
+            pass  # already removed by the write-stage handler
     out, _, code = p.stdout.decode().rpartition("\n") if p and p.stdout else ("", "", "0")
     try:
         url = json.loads(out)["fields"]["url"]["stringValue"]
