@@ -11,25 +11,38 @@ for k in list(os.environ):
 CONFDIR = os.path.expanduser("~/.config/kgl")
 BASEFILE = os.path.join(CONFDIR, "base")
 os.makedirs(CONFDIR, mode=0o700, exist_ok=True)
+try:
+    os.chmod(CONFDIR, 0o700)  # tighten pre-existing dirs from older versions
+except OSError:
+    pass
 
 import urllib.request
 
 
 def curl(url, body=None, method=None):
-    """Returns (status_code, text). Raises on transport failure."""
-    cmd = ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}", url]
-    if body is not None:
-        cmd += ["-X", method or "POST", "--data-binary", "@" + body]
-    elif method:
-        cmd += ["-X", method]
-    for i in range(3):  # ponytail: local proxy route is flaky
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        if p.returncode == 0:
-            break
-        if p.returncode != 28 or i == 2:  # 28 = timeout, worth retrying
-            sys.exit(f"curl failed ({p.returncode}): {p.stderr[:200]}")
-    out, _, code = p.stdout.rpartition("\n")
-    return int(code), out
+    """Returns (status_code, text). URL (embeds the JWE credential) goes via a
+    0600 curl config file, never argv. Raises on transport failure."""
+    import tempfile
+    kf = tempfile.NamedTemporaryFile("w", suffix=".kgl", delete=False)
+    try:
+        os.chmod(kf.name, 0o600)
+        kf.write(f'url = "{url}"\n')
+        kf.close()
+        cmd = ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}", "-K", kf.name]
+        if body is not None:
+            cmd += ["-X", method or "POST", "--data-binary", "@" + body]
+        elif method:
+            cmd += ["-X", method]
+        for i in range(3):  # ponytail: local proxy route is flaky
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            if p.returncode == 0:
+                break
+            if p.returncode != 28 or i == 2:  # 28 = timeout, worth retrying
+                sys.exit(f"curl failed ({p.returncode}): {p.stderr[:200]}")
+        out, _, code = p.stdout.rpartition("\n")
+        return int(code), out
+    finally:
+        os.unlink(kf.name)
 
 
 def base():
@@ -107,11 +120,10 @@ def _cookie_store():
                 CK = "; ".join(f"{c['name']}={c['value']}" for c in slim)
                 XSRF = [p.split("=", 1)[1] for p in CK.split("; ") if p.startswith("XSRF-TOKEN=")]
                 if XSRF:
-                    out = subprocess.run(["curl", "-s", "--noproxy", "*", "-m", "10",
+                    code, out = _post_json(
                         "https://www.kaggle.com/api/i/users.UsersService/GetCurrentUser",
-                        "-H", "content-type: application/json",
-                        "-H", f"x-xsrf-token: {XSRF[0]}", "-b", CK, "-d", "{}"],
-                        capture_output=True, text=True).stdout
+                        {}, {"x-xsrf-token": XSRF[0], "cookie": CK})
+                    out = json.dumps(out or {})
                     if '"userId"' in out or '"user"' in out:
                         json.dump(slim, open(cookiefile, "w"))
                         os.chmod(cookiefile, 0o600)
@@ -127,10 +139,14 @@ def _cookie_store():
 
 
 def _secure_write(path, data):
-    """Write with 0600 — cookies/base hold live credentials."""
+    """Write with 0600 — cookies/base hold live credentials; also tightens
+    files created by older versions with wider modes."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.write(fd, data if isinstance(data, bytes) else data.encode())
-    os.close(fd)
+    try:
+        os.write(fd, data if isinstance(data, bytes) else data.encode())
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
 
 
 def _post_json(url, body_obj, headers):
@@ -142,17 +158,19 @@ def _post_json(url, body_obj, headers):
     for h, v in headers.items():
         kf.write(f'header = "{h}: {v}"\n')
     kf.close()
-    p = None
-    for i in range(3):  # ponytail: local route to kaggle is flaky; retry transient failures
-        p = subprocess.run(
-            ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}",
-             "-K", kf.name, url, "-H", "content-type: application/json",
-             "--data-binary", "@-"],
-            input=json.dumps(body_obj).encode(), capture_output=True)
-        if p.returncode == 0 and p.stdout:
-            break
-        time.sleep(1)
-    os.unlink(kf.name)
+    try:
+        p = None
+        for i in range(3):  # ponytail: local route to kaggle is flaky; retry transient failures
+            p = subprocess.run(
+                ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}",
+                 "-K", kf.name, url, "-H", "content-type: application/json",
+                 "--data-binary", "@-"],
+                input=json.dumps(body_obj).encode(), capture_output=True)
+            if p.returncode == 0 and p.stdout:
+                break
+            time.sleep(1)
+    finally:
+        os.unlink(kf.name)
     if p is None or p.returncode != 0:
         return 0, None
     out, _, code = p.stdout.decode().rpartition("\n")
@@ -175,6 +193,22 @@ def _auth_err(code, body):
     if code == 0:
         return f"network failure: {str(body)[:150]}"
     return f"HTTP {code}: {str(body)[:200]}"
+
+
+def _select_session(sessions, which):
+    """Pick exactly one session by title substring or kernelRunId; refuse to guess."""
+    if not sessions:
+        sys.exit("no interactive session; run a cell in the notebook once")
+    if which:
+        cand = [s for s in sessions if which.isdigit() and str(s["kernelRunId"]) == which
+                or which.lower() in s.get("title", "").lower()]
+    else:
+        cand = sessions if len(sessions) == 1 else []
+    if len(cand) != 1:
+        sys.exit("ambiguous/unknown session — pick one:\n" +
+                 "\n".join(f'  kgl bootstrap "{s["title"]}"   (kernelRunId {s["kernelRunId"]})'
+                           for s in sessions))
+    return cand[0]
 
 
 def bootstrap(which=None):
@@ -203,18 +237,7 @@ def bootstrap(which=None):
         return out
 
     sessions = kgl_api("ListKernelSessions").get("sessions", [])
-    if not sessions:
-        sys.exit("no interactive session; run a cell in the notebook once")
-    if which:
-        cand = [s for s in sessions if which.isdigit() and str(s["kernelRunId"]) == which
-                or which.lower() in s.get("title", "").lower()]
-    else:
-        cand = sessions if len(sessions) == 1 else []
-    if len(cand) != 1:
-        sys.exit("ambiguous/unknown session — pick one:\n" +
-                 "\n".join(f'  kgl bootstrap "{s["title"]}"   (kernelRunId {s["kernelRunId"]})'
-                           for s in sessions))
-    run = cand[0]
+    run = _select_session(sessions, which)
     run_id = run["kernelRunId"]
     print(f"session: {run['title']} (kernelRunId {run_id})")
 
@@ -238,17 +261,19 @@ def bootstrap(which=None):
     os.chmod(kf.name, 0o600)
     kf.write(f'header = "Authorization: Bearer {idt}"\n')
     kf.close()
-    p = None
-    for i in range(3):
-        p = subprocess.run(
-            ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}", "-K", kf.name,
-             f"https://firestore.googleapis.com/v1/projects/kkb-production/databases/(default)/"
-             f"documents/sessions/{doc}/data/JupyterURL"],
-            capture_output=True)
-        if p.returncode == 0 and p.stdout:
-            break
-        time.sleep(1)
-    os.unlink(kf.name)
+    try:
+        p = None
+        for i in range(3):
+            p = subprocess.run(
+                ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}", "-K", kf.name,
+                 f"https://firestore.googleapis.com/v1/projects/kkb-production/databases/(default)/"
+                 f"documents/sessions/{doc}/data/JupyterURL"],
+                capture_output=True)
+            if p.returncode == 0 and p.stdout:
+                break
+            time.sleep(1)
+    finally:
+        os.unlink(kf.name)
     out, _, code = p.stdout.decode().rpartition("\n") if p and p.stdout else ("", "", "0")
     try:
         url = json.loads(out)["fields"]["url"]["stringValue"]

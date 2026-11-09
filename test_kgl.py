@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Offline unit tests for kgl internals — no network, curl is mocked.
+"""Offline unit tests for kgl internals — no network, no browser, curl mocked.
 
 Run: python3 test_kgl.py
 """
-import json, os, subprocess, sys, tempfile, types
+import json, os, shutil, subprocess, sys, tempfile, types
 
-# import kgl as module (skip main())
 SRC = open(os.path.join(os.path.dirname(__file__), "kgl")).read()
 SRC = SRC.replace('if __name__ == "__main__":\n    main()', '')
 kgl = types.ModuleType("kgl")
@@ -21,8 +20,8 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-# --- fixtures ------------------------------------------------------------
-GOOD_COOKIES = [
+# --- isolation: no browser, no real cookie store --------------------------
+kgl._cookie_store = lambda: [
     {"name": "XSRF-TOKEN", "value": "xsrf123", "domain": ".kaggle.com",
      "path": "/", "secure": True},
     {"name": "ka_sessionid", "value": "sess456", "domain": ".kaggle.com",
@@ -32,127 +31,120 @@ NO_XSRF = [{"name": "ka_sessionid", "value": "x", "domain": ".kaggle.com",
             "path": "/", "secure": True}]
 
 
-def with_cookies(cookies, fn):
-    """Run fn with cookiefile swapped to fixture."""
-    cf = os.path.join(TMP, "cookies.json")
-    old = kgl.BASEFILE
-    json.dump(cookies, open(cf, "w"))
-    kgl_cookiefile = os.path.join(kgl.CONFDIR, "cookies.json")
-    # monkeypatch _cookie_store's file location via CONFDIR
-    orig_confdir = kgl.CONFDIR
-    kgl.CONFDIR = TMP
-    try:
-        return fn()
-    finally:
-        kgl.CONFDIR = orig_confdir
-
-
-# --- 1. XSRF missing -> clear error, not IndexError ----------------------
+# --- 1. XSRF missing -> clear error, not IndexError -----------------------
 def t_missing_xsrf():
+    kgl._cookie_store = lambda: NO_XSRF
     try:
-        with_cookies(NO_XSRF, lambda: kgl.bootstrap())
+        kgl.bootstrap()
         check("xsrf-missing exits", False)
     except SystemExit as e:
         check("xsrf-missing exits", True)
         check("xsrf-missing message actionable",
               "XSRF" in str(e) and "re-login" in str(e), str(e))
+    finally:
+        kgl._cookie_store = lambda: [
+            {"name": "XSRF-TOKEN", "value": "xsrf123", "domain": ".kaggle.com",
+             "path": "/", "secure": True}]
 
 
 t_missing_xsrf()
 
 
-# --- 2. session selection -------------------------------------------------
+# --- 2. session selection: tests the REAL _select_session ------------------
 SESSIONS = [
     {"kernelRunId": 111, "title": "Tesla_T4x2", "dateCreated": "2026-11-09T01:00:00Z"},
     {"kernelRunId": 222, "title": "My CPU nb", "dateCreated": "2026-11-09T02:00:00Z"},
 ]
 
-def t_session_pick():
-    with_cookies(GOOD_COOKIES, lambda: None)  # ensure cookiefile exists
-    try:
-        _pick(SESSIONS, None)
-        check("two-sessions refuses", False)
-    except SystemExit:
-        check("two-sessions refuses", True)
 
-    check("by title substring", _pick(SESSIONS, "tesla") == 111)
-    check("by runId", _pick(SESSIONS, "222") == 222)
-    check("single auto", _pick(SESSIONS[:1], None) == 111)
+def t_session_pick():
     try:
-        _pick(SESSIONS, "no-match")
+        kgl._select_session(SESSIONS, None)
+        check("two-sessions refuses", False)
+    except SystemExit as e:
+        check("two-sessions refuses", "Tesla" in str(e) and "CPU" in str(e))
+    check("by title substring", kgl._select_session(SESSIONS, "tesla")["kernelRunId"] == 111)
+    check("by runId", kgl._select_session(SESSIONS, "222")["kernelRunId"] == 222)
+    check("single auto", kgl._select_session(SESSIONS[:1], None)["kernelRunId"] == 111)
+    try:
+        kgl._select_session(SESSIONS, "no-match")
         check("unknown refuses", False)
     except SystemExit:
         check("unknown refuses", True)
+    try:
+        kgl._select_session([], None)
+        check("empty refuses", False)
+    except SystemExit:
+        check("empty refuses", True)
 
-def _pick(sessions, which):
-    """Mirror of bootstrap's selection logic (kept in sync manually)."""
-    if which:
-        cand = [s for s in sessions
-                if which.isdigit() and str(s["kernelRunId"]) == which
-                or which.lower() in s.get("title", "").lower()]
-    else:
-        cand = sessions if len(sessions) == 1 else []
-    if len(cand) != 1:
-        raise SystemExit("ambiguous")
-    return cand[0]["kernelRunId"]
 
 t_session_pick()
 
 
 # --- 3. _auth_err classification ------------------------------------------
 def t_auth_err():
-    m = kgl._auth_err(403, None)
-    check("403 -> re-login hint", "re-login" in m, m)
-    m = kgl._auth_err(0, "boom")
-    check("0 -> network", "network" in m, m)
-    m = kgl._auth_err(500, {"error": "x"})
-    check("500 surfaces code", "500" in m, m)
+    check("403 -> re-login hint", "re-login" in kgl._auth_err(403, None))
+    check("permission-denied body -> re-login hint",
+          "re-login" in kgl._auth_err(200, {"error": {"status": "PERMISSION_DENIED"}}))
+    check("0 -> network", "network" in kgl._auth_err(0, "boom"))
+    check("500 surfaces code", "500" in kgl._auth_err(500, {"error": "x"}))
+    check("string error body does not crash",
+          "500" in kgl._auth_err(500, {"error": "plain-string"}))
+
 
 t_auth_err()
 
 
-# --- 4. _secure_write permissions -----------------------------------------
+# --- 4. _secure_write tightens pre-existing wide files --------------------
 def t_secure_write():
     p = os.path.join(TMP, "sec")
+    open(p, "w").write("old")
+    os.chmod(p, 0o644)
     kgl._secure_write(p, "secret")
     mode = os.stat(p).st_mode & 0o777
-    check("secure write 0600", mode == 0o600, oct(mode))
-    check("secure write content", open(p).read() == "secret")
+    check("tightens existing 0644 -> 0600", mode == 0o600, oct(mode))
+    check("content written", open(p).read() == "secret")
+
 
 t_secure_write()
 
 
-# --- 5. _post_json: credentials not in argv -------------------------------
-def t_post_json_argv():
+# --- 5. credentials not in argv (both helpers) -----------------------------
+def t_argv():
     real_run = subprocess.run
-    seen_argv = []
+    seen = []
 
     def spy_run(cmd, **kw):
-        seen_argv.append(cmd)
-        return real_run(["true"], **{"capture_output": True, "input": b""})
+        seen.append(cmd)
+        text_mode = kw.get("text")
+        kw.pop("input", None)
+        r = real_run(["true"], **kw)
+        r.stdout = "x\n200" if text_mode else b"x\n200"
+        return r
 
     subprocess.run = spy_run
     try:
         kgl._post_json("https://x/", {}, {"cookie": "SECRETVALUE", "Authorization": "Bearer TOK"})
+        kgl.curl("https://x/JWE-SECRET", None, "GET")
     finally:
         subprocess.run = real_run
-    joined = " ".join(seen_argv[0]) if seen_argv else ""
-    check("no secret in argv", "SECRETVALUE" not in joined and "TOK" not in joined, joined[:120])
-    check("uses -K config", any(a == "-K" for a in seen_argv[0]) if seen_argv else False)
+    for i, argv in enumerate(seen):
+        joined = " ".join(argv)
+        check(f"no secret in argv [{i}]",
+              "SECRETVALUE" not in joined and "TOK" not in joined
+              and "JWE-SECRET" not in joined, joined[:120])
+        check(f"uses -K config [{i}]", "-K" in argv)
 
-t_post_json_argv()
+
+t_argv()
 
 
-# --- 6. _post_json parsing with mock curl ----------------------------------
-def t_post_json_parse():
+# --- 6. _post_json parsing + temp file cleanup on exception ----------------
+def t_post_json():
     real_run = subprocess.run
     RESP = b'{"ok": true}\n200'
-
-    def fake_run(cmd, **kw):
-        class R: returncode = 0; stdout = RESP
-        return R()
-
-    subprocess.run = fake_run
+    subprocess.run = fake_run = (lambda cmd, **kw:
+                                 type("R", (), {"returncode": 0, "stdout": RESP})())
     try:
         code, out = kgl._post_json("https://x/", {}, {})
         check("parses code", code == 200)
@@ -160,9 +152,31 @@ def t_post_json_parse():
     finally:
         subprocess.run = real_run
 
-t_post_json_parse()
+    # exception during curl -> config file still removed
+    left = []
+
+    def boom_run(cmd, **kw):
+        raise KeyboardInterrupt
+
+    subprocess.run = boom_run
+    before = set(os.listdir(tempfile.gettempdir()))
+    try:
+        try:
+            kgl._post_json("https://x/", {}, {"cookie": "S"})
+            check("exception propagates", False)
+        except KeyboardInterrupt:
+            check("exception propagates", True)
+    finally:
+        subprocess.run = real_run
+        after = set(os.listdir(tempfile.gettempdir()))
+    check("no config file left after exception",
+          not any(f.endswith(".kgl") for f in after - before), str(after - before))
 
 
+t_post_json()
+
+
+shutil.rmtree(TMP, ignore_errors=True)
 print()
 if FAILS:
     print("FAILED:", FAILS)
