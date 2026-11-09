@@ -610,79 +610,124 @@ def _headless_action(action, wait=30, timeout=240):
             print(f"stop not confirmed within {timeout}s", file=sys.stderr)
             return 1
         if action == "run-all":
-            # pre-click baseline: max cell execution_count in the draft. A
-            # busy kernel alone proves nothing (it may have been busy before);
-            # success = THIS click's execution, i.e. counts moved or our poll
-            # catches the (idle ->) busy run.
-            baseline = None
+            # Causal proof of execution, strongest first:
+            #   1. execute_input on the target kernel's iopub whose code matches
+            #      one of THIS notebook's cells, arriving after the click.
+            #      (residual: another client running the same notebook, or a
+            #      Run All queued before our click — accepted, documented)
+            #   2. live-notebook execution_count vs a PRE-CLICK LIVE snapshot
+            #      (never the draft: it can lag live state or hold stale
+            #      counters from a previous kernel)
+            #   3. busy on the target kernel — valid ONLY when the session was
+            #      CREATED by this click (fresh kernel starts idle); busy on a
+            #      pre-existing session may predate the click
+            import threading
+            events, stop = [], {"v": False}
+            listener = None
+            pre_counts = None       # live-notebook snapshot (same source as post)
+            session_existed = False
+            cell_codes = None       # code-membership allowlist for association
+
+            def _cells_of(nb):
+                if not isinstance(nb, dict):
+                    return None
+                return [c.get("source") for c in nb.get("cells", [])
+                        if isinstance(c, dict) and c.get("cell_type") == "code"]
+
+            def _attach_listener(route, tgt):
+                nonlocal listener
+                if listener is None:
+                    listener = threading.Thread(
+                        target=_iopub_listener,
+                        args=(route, tgt, events, stop, cell_codes), daemon=True)
+                    listener.start()
+
             try:
                 kid0 = _notebook_kernel_id(required=False)
-                if kid0:
-                    nb0 = _draft_notebook(kid0)
-                    if nb0 is not None:
-                        baseline = _nb_max_exec(nb0)
+                if kid0 is not None:
+                    ok0, runs0 = _target_sessions(kid0)
+                    if ok0 and runs0:
+                        session_existed = True
+                        try:
+                            route0 = _mint_route(str(min(runs0)))
+                            _, sb0 = _fetch_json(f"{route0}/api/sessions")
+                            tgt0 = next((s.get("kernel", {}).get("id")
+                                         for s in (sb0 or [])
+                                         if isinstance(s, dict)
+                                         and s.get("path") == "__notebook_source__.ipynb"),
+                                        None)
+                            _, cb0 = _fetch_json(
+                                f"{route0}/api/contents/__notebook_source__.ipynb?content=1")
+                            nb0 = (cb0 or {}).get("content") if isinstance(cb0, dict) else None
+                            if isinstance(nb0, dict):
+                                pre_counts = _nb_max_exec(nb0)
+                                cell_codes = _cells_of(nb0)
+                            if tgt0:
+                                _attach_listener(route0, tgt0)
+                        except SystemExit:
+                            pass  # pre-click snapshot is best-effort
             except SystemExit:
                 pass
+            t_click = time.time()
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>/Run All/i.test(b.getAttribute('aria-label')||b.innerText));"
                       "if(!b) return 'no-runall'; b.click(); return 'runall-clicked';})()")
             print(r)
             if "clicked" not in str(r):
                 return 1
-            # verify: target kernel gains/regains a session AND its kernel goes busy
-            # (an existing session alone proves nothing — the click may not have fired)
-            t_click = time.time()
-            t0 = t_click
-            while time.time() - t0 < timeout:
-                kid = _notebook_kernel_id(required=False)  # resolves once a session exists
-                if kid is not None:
-                    ok, runs = _target_sessions(kid)
-                    if ok and runs:
-                        run_id = min(runs)  # kernelRUNid — mint matches on this
-                        try:
-                            # one-off route: does NOT overwrite the global base
-                            # file (user may be connected to another notebook)
-                            route = _mint_route(str(run_id))
-                            kcode, kbody = _fetch_json(f"{route}/api/kernels")
-                            scode, sbody = _fetch_json(f"{route}/api/sessions")
-                            if kcode >= 400 or scode >= 400 or \
-                               not isinstance(kbody, list) or not isinstance(sbody, list):
-                                time.sleep(3)  # error/auth blip — keep polling
-                                continue
-                            # target kernel = the notebook's own session kernel;
-                            # unidentifiable target or another kernel's state
-                            # proves NOTHING about this run-all
-                            tgt = None
-                            for sess in sbody:
-                                if sess.get("path") == "__notebook_source__.ipynb":
-                                    tgt = sess.get("kernel", {}).get("id")
-                            if tgt is None:
-                                time.sleep(3)  # notebook session not up yet
-                                continue
-                            for k in kbody:
-                                if k.get("id") == tgt and k.get("execution_state") == "busy":
-                                    print(f"run-all executing (kernel {kid}, run {run_id})")
-                                    return 0
-                            if baseline is not None:
-                                # counts on the session's live notebook moved
-                                # past the pre-click draft baseline == cells
-                                # ran because of THIS click (fast cells too)
-                                _, cnb = _fetch_json(
-                                    f"{route}/api/contents/__notebook_source__.ipynb?content=1")
-                                live = ((cnb or {}).get("content")
-                                        if isinstance(cnb, dict) else None)
-                                if isinstance(live, dict) and _nb_max_exec(live) > baseline:
-                                    print(f"run-all executed (kernel {kid}, run {run_id}; "
-                                          "cells already completed)")
-                                    return 0
-                            # ponytail: with no baseline, busy-only — honest rc 1
-                            # for fast cells rather than trusting weak signals
-                        except SystemExit:
-                            pass  # route mint flaky; keep polling
-                time.sleep(3)
-            print(f"execution not confirmed within {timeout}s "
-                  "(no session, or kernel never went busy)", file=sys.stderr)
-            return 1
+            try:
+                t0 = t_click
+                while time.time() - t0 < timeout:
+                    if any(e > t_click for e in events):
+                        print("run-all executing (execute_input for this notebook's cells)")
+                        return 0
+                    kid = _notebook_kernel_id(required=False)
+                    if kid is not None:
+                        ok, runs = _target_sessions(kid)
+                        if ok and runs:
+                            run_id = min(runs)  # kernelRUNid — mint matches on this
+                            try:
+                                # one-off route: never overwrites the global base
+                                route = _mint_route(str(run_id))
+                                kcode, kbody = _fetch_json(f"{route}/api/kernels")
+                                scode, sbody = _fetch_json(f"{route}/api/sessions")
+                                if (kcode >= 400 or scode >= 400
+                                        or not isinstance(kbody, list)
+                                        or not isinstance(sbody, list)):
+                                    time.sleep(3)
+                                    continue
+                                tgt = next((s.get("kernel", {}).get("id")
+                                            for s in sbody
+                                            if s.get("path") == "__notebook_source__.ipynb"),
+                                           None)
+                                if tgt is None:
+                                    time.sleep(3)
+                                    continue
+                                _attach_listener(route, tgt)  # late subscribe (fresh session)
+                                if not session_existed:
+                                    # fresh kernel starts idle: busy here IS our click
+                                    for k in kbody:
+                                        if (k.get("id") == tgt
+                                                and k.get("execution_state") == "busy"):
+                                            print("run-all executing (fresh session busy)")
+                                            return 0
+                                if pre_counts is not None:
+                                    _, cb = _fetch_json(
+                                        f"{route}/api/contents/__notebook_source__.ipynb?content=1")
+                                    live = (cb or {}).get("content") if isinstance(cb, dict) else None
+                                    if (isinstance(live, dict)
+                                            and _nb_max_exec(live) > pre_counts):
+                                        print("run-all executed (live counts advanced)")
+                                        return 0
+                            except SystemExit:
+                                pass  # route mint flaky; keep polling
+                    time.sleep(3)
+                print(f"execution not confirmed within {timeout}s — no causal evidence "
+                      "(matched execute_input / live-count advance / fresh-session busy)",
+                      file=sys.stderr)
+                return 1
+            finally:
+                stop["v"] = True
         if action == "save":
             kid_now = _notebook_kernel_id()
             before = None                       # refuse a failed baseline
@@ -779,10 +824,17 @@ def _fetch_json(url):
         return int(code or 0), None
 
 
-def _iopub_listener(route, kernel_id, events, stop):
+def _iopub_listener(route, kernel_id, events, stop, cell_codes=None):
     """Background thread: record timestamps of execute_input messages on the
-    target kernel — the ONLY signal that directly proves cells executing."""
+    target kernel whose code matches one of THIS notebook's cells — the
+    association that ties execution to a Run All of this notebook (other
+    kernels are excluded by the channel; unrelated code by the allowlist)."""
     import websocket
+
+    def _txt(src):
+        return "".join(src) if isinstance(src, list) else str(src or "")
+
+    allow = {_txt(c) for c in (cell_codes or [])} or None
     try:
         url = route.replace("https://", "wss://") + f"/api/kernels/{kernel_id}/channels"
         ws = websocket.create_connection(url, timeout=10, suppress_origin=False,
@@ -795,9 +847,10 @@ def _iopub_listener(route, kernel_id, events, stop):
                 continue
             except Exception:
                 return
-            if m.get("msg_type") == "execute_input" or (
-                    m.get("header", {}).get("msg_type") == "execute_input"):
-                events.append(time.time())
+            mt = m.get("msg_type") or m.get("header", {}).get("msg_type")
+            if mt == "execute_input":
+                if allow is None or _txt((m.get("content") or {}).get("code")) in allow:
+                    events.append(time.time())
     except Exception:
         return
 

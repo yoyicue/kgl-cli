@@ -3,7 +3,7 @@
 
 Run: python3 test_kgl.py
 """
-import json, os, shutil, subprocess, sys, tempfile, types
+import json, os, shutil, subprocess, sys, tempfile, time, types
 
 TMP = tempfile.mkdtemp()
 os.environ["HOME"] = TMP  # isolate before exec: kgl's import runs makedirs/chmod
@@ -863,6 +863,134 @@ def t_cache_retry_mismatch():
 
 
 t_cache_retry_mismatch()
+
+
+# --- FULL run-all path through _headless_action (mocked chrome + APIs) -------
+def _runall_scenario(name, *, pre_session=True, busy=False,
+                     exec_input=False, want_rc=0, want_msg=""):
+    """Drive the REAL _headless_action("run-all") with chrome fully faked."""
+    import websocket as wsmod
+    orig = {f: getattr(kgl, f) for f in
+            ("_chrome_bin", "_cookie_store", "_notebook_slug", "_notebook_kernel_id",
+             "_target_sessions", "_mint_route", "_fetch_json", "_iopub_listener")}
+    real_sleep = kgl.time.sleep
+
+    class FakeCDP:
+        def __init__(self): self.last = None
+        def send(self, d):
+            try:
+                self.last = json.loads(d) if isinstance(d, str) else d
+            except Exception:
+                self.last = {}
+        def recv(self):
+            m = self.last or {}
+            if m.get("method") == "Runtime.evaluate":
+                return json.dumps({"id": m.get("id", 1),
+                                   "result": {"result": {"value": "runall-clicked"}}})
+            return json.dumps({"id": m.get("id", 1), "result": {}})
+        def settimeout(self, t): pass
+        def close(self): pass
+
+    kgl._chrome_bin = lambda: "/bin/true"
+    kgl._cookie_store = lambda: [{"name": "XSRF-TOKEN", "value": "x",
+                                  "domain": ".kaggle.com"}]
+    kgl._notebook_slug = lambda: "owner/nb"
+    kgl._notebook_kernel_id = lambda required=True: 111
+    kgl._target_sessions = lambda kid: (True, {777})
+    kgl._mint_route = lambda w=None: "https://route/proxy"
+    NB_LIVE = {"cells": [{"cell_type": "code", "source": "print(1)",
+                          "execution_count": 5}]}
+    def fake_fetch(url):
+        if "api/sessions" in url:
+            return 200, [{"path": "__notebook_source__.ipynb",
+                          "kernel": {"id": "K1"}}]
+        if "api/kernels" in url:
+            return 200, [{"id": "K1",
+                          "execution_state": "busy" if busy else "idle"}]
+        if "api/contents" in url:
+            return 200, {"content": NB_LIVE}
+        return 200, {}
+    kgl._fetch_json = fake_fetch
+
+    def fake_listener(route, kid, events, stop, cell_codes=None):
+        if exec_input:
+            events.append(time.time() + 3600)  # guaranteed > t_click
+
+    kgl._iopub_listener = fake_listener
+    kgl.time = types.SimpleNamespace(time=kgl.time.time,
+        strftime=kgl.time.strftime, sleep=lambda sec: None)
+
+    class FakeProc:
+        args, returncode = [], 0
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, t=None): return 0
+        def poll(self): return None
+        def communicate(self, i=None, timeout=None): return (b"{}", b"")
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    real_popen, real_run, real_co = subprocess.Popen, subprocess.run, subprocess.check_output
+    subprocess.Popen = lambda *a, **k: FakeProc()
+    def fake_run(cmd, **kw):
+        return types.SimpleNamespace(returncode=0, stdout=b"{}\n200")
+    subprocess.run = fake_run
+    def fake_co(cmd, **kw):
+        c = " ".join(cmd)
+        if "json/version" in c:
+            return json.dumps({"Browser": "Chrome/1",
+                               "webSocketDebuggerUrl": "ws://fake"}).encode()
+        if "json/new" in c:
+            return json.dumps({"id": "T1", "type": "page",
+                               "url": "https://www.kaggle.com/code/owner/nb/edit",
+                               "webSocketDebuggerUrl": "ws://fake-tab"}).encode()
+        if "json/list" in c:
+            return json.dumps([{"id": "T1", "type": "page",
+                                "url": "https://www.kaggle.com/code/owner/nb/edit",
+                                "webSocketDebuggerUrl": "ws://fake-tab"}]).encode()
+        return b"{}"
+    subprocess.check_output = fake_co
+    real_conn = wsmod.create_connection
+    wsmod.create_connection = lambda *a, **k: FakeCDP()
+    import io, contextlib, tempfile, shutil
+    prof = tempfile.mkdtemp()
+    open(os.path.join(prof, "DevToolsActivePort"), "w").write("1\n/x\n")
+    real_mkdtemp = tempfile.mkdtemp
+    tempfile.mkdtemp = lambda *a, **k: prof
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = kgl._headless_action("run-all", wait=0, timeout=1)
+        out = buf.getvalue()
+        check(f"run-all[{name}] rc={want_rc}", rc == want_rc, f"got rc={rc} out={out[:140]!r}")
+        if want_msg:
+            check(f"run-all[{name}] msg", want_msg in out, out[:150])
+    finally:
+        for f, v in orig.items():
+            setattr(kgl, f, v)
+        kgl.time = types.SimpleNamespace(time=kgl.time.time,
+            strftime=kgl.time.strftime, sleep=real_sleep)
+        subprocess.Popen = real_popen
+        subprocess.run = real_run
+        subprocess.check_output = real_co
+        wsmod.create_connection = real_conn
+        tempfile.mkdtemp = real_mkdtemp
+        shutil.rmtree(prof, ignore_errors=True)
+
+
+def t_runall_full_paths():
+    # 1. pre-existing session, stays busy, NO exec evidence -> must NOT pass
+    #    (this is the false-positive the reviewer reproduced)
+    _runall_scenario("pre-busy no evidence", busy=True, exec_input=False,
+                     want_rc=1)
+    # 2. execute_input observed -> pass
+    _runall_scenario("exec_input", exec_input=True,
+                     want_rc=0, want_msg="execute_input")
+    # 3. idle everywhere, no evidence -> fail honestly
+    _runall_scenario("no evidence", busy=False, exec_input=False, want_rc=1)
+
+
+t_runall_full_paths()
 
 
 # --- run-all causal signal strength (unit table) -----------------------------
