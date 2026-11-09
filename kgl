@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""kgl - control Kaggle notebook sandbox (Jupyter) from local terminal."""
+import base64, json, os, subprocess, sys, time, uuid
+from urllib.parse import quote
+
+# ponytail: no proxy env, direct connection
+for k in list(os.environ):
+    if k.lower() in ("http_proxy", "https_proxy", "all_proxy"):
+        del os.environ[k]
+
+CONFDIR = os.path.expanduser("~/.config/kgl")
+BASEFILE = os.path.join(CONFDIR, "base")
+os.makedirs(CONFDIR, exist_ok=True)
+
+import urllib.request
+
+
+def curl(url, body=None, method=None):
+    """Returns (status_code, text). Raises on transport failure."""
+    cmd = ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}", url]
+    if body is not None:
+        cmd += ["-X", method or "POST", "--data-binary", "@" + body]
+    elif method:
+        cmd += ["-X", method]
+    for i in range(3):  # ponytail: local proxy route is flaky
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode == 0:
+            break
+        if p.returncode != 28 or i == 2:  # 28 = timeout, worth retrying
+            sys.exit(f"curl failed ({p.returncode}): {p.stderr[:200]}")
+    out, _, code = p.stdout.rpartition("\n")
+    return int(code), out
+
+
+def base():
+    b = open(BASEFILE).read().strip()
+    if not b:
+        sys.exit("no base. run: kgl bootstrap")
+    return b.rstrip("/")
+
+
+def qpath(path):
+    """URL-encode a remote path, preserving /."""
+    return quote(path, safe="/")
+
+
+def api(path, obj=None, method=None):
+    """obj: python object -> JSON body written to temp file."""
+    body = None
+    try:
+        if obj is not None:
+            import tempfile
+            f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+            json.dump(obj, f)
+            f.close()
+            body = f.name
+        code, out = curl(f"{base()}/{path}", body, method)
+    finally:
+        if body:
+            os.unlink(body)
+    if code >= 400:
+        sys.exit(f"HTTP {code}: {out[:300]}")
+    try:
+        return json.loads(out)
+    except Exception:
+        sys.exit(f"bad json (HTTP {code}): {out[:200]}")
+
+
+def bootstrap():
+    import websocket
+    tabs = json.loads(subprocess.check_output(["curl", "-s", "--noproxy", "*",
+                    "http://localhost:9222/json/list"]))
+    try:
+        frame = next(t for t in tabs if t["type"] == "iframe" and "jupyter-proxy" in t["url"])
+    except StopIteration:
+        sys.exit("open the notebook edit page in the 9222 chrome first")
+    ws = websocket.create_connection(frame["webSocketDebuggerUrl"], timeout=30, suppress_origin=True)
+    ws.send(json.dumps({"id": 1, "method": "Network.enable"}))
+    ws.send(json.dumps({"id": 2, "method": "Page.reload"}))
+    t0 = time.time()
+    while time.time() - t0 < 20:
+        try:
+            m = json.loads(ws.recv())
+        except websocket.WebSocketTimeoutException:
+            continue
+        if m.get("method") == "Network.requestWillBeSent":
+            u = m["params"]["request"]["url"]
+            if "/proxy/api/" in u:
+                b = u.split("/proxy/")[0] + "/proxy"
+                open(BASEFILE, "w").write(b)
+                print("saved:", b[:80] + "…")
+                return
+    sys.exit("bootstrap failed: no /proxy/api request seen")
+
+
+def pick_kernel_id():
+    """Kernel of the notebook session, KGL_KERNEL override, else fail loudly."""
+    if os.environ.get("KGL_KERNEL"):
+        return os.environ["KGL_KERNEL"]
+    sessions = api("api/sessions")
+    if not sessions:
+        sys.exit("no running session; run a cell in the notebook first")
+    for s in sessions:
+        if s.get("path") == "__notebook_source__.ipynb":
+            return s["kernel"]["id"]
+    sys.exit("multiple sessions and no notebook match; pick one:\n" +
+             "\n".join(f'  {s["kernel"]["id"]}  {s.get("path")}' for s in sessions))
+
+
+def ws_kernel(kernel_id=None):
+    import websocket
+    kid = kernel_id or pick_kernel_id()
+    url = base().replace("https://", "wss://") + f"/api/kernels/{kid}/channels"
+    # ponytail: local proxy route is flaky; 3 attempts
+    for i in range(3):
+        try:
+            return websocket.create_connection(url, timeout=15, suppress_origin=False, origin=base())
+        except Exception as e:
+            if i == 2:
+                raise
+            time.sleep(1)
+
+
+def run_code(code, timeout=600, kernel_id=None):
+    """Returns process-style exit code: 0 ok, 1 error, 124 timeout."""
+    ws = ws_kernel(kernel_id)
+    mid = str(uuid.uuid4())
+    ws.send(json.dumps({
+        "header": {"msg_id": mid, "msg_type": "execute_request", "username": "kgl",
+                   "session": "kgl-local", "version": "5.3"},
+        "parent_header": {}, "metadata": {}, "buffers": [],
+        "content": {"code": code, "silent": False, "store_history": True,
+                    "user_expressions": {}, "allow_stdin": False}}))
+    import websocket as _w
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            m = json.loads(ws.recv())
+        except _w.WebSocketTimeoutException:
+            continue  # quiet execution; keep waiting until overall timeout
+        if m.get("parent_header", {}).get("msg_id") != mid:
+            continue
+        t = m["msg_type"]
+        if t == "stream":
+            print(m["content"]["text"], end="",
+                  file=sys.stderr if m["content"].get("name") == "stderr" else sys.stdout)
+        elif t == "execute_result":
+            print(m["content"]["data"].get("text/plain", ""), end="")
+        elif t == "error":
+            print("\n".join(m["content"]["traceback"][-6:]), file=sys.stderr)
+            return 1
+        elif t == "status" and m["content"]["execution_state"] == "idle":
+            return 0
+    print(f"(timeout after {timeout}s; execution may still be running remotely)", file=sys.stderr)
+    return 124
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: kgl bootstrap|status|exec CODE|sh CMD|get REMOTE [LOCAL]|put LOCAL REMOTE|term", file=sys.stderr)
+        sys.exit(1)
+    cmd = sys.argv[1]
+    if cmd == "bootstrap":
+        return bootstrap()
+    if cmd == "status":
+        print(json.dumps(api("api/kernels"), indent=1))
+        print("terminals:", json.dumps(api("api/terminals")))
+        return
+    if cmd == "exec":
+        return sys.exit(run_code(sys.argv[2], kernel_id=os.environ.get("KGL_KERNEL")))
+    if cmd == "sh":
+        # exit-code marker goes to stderr; stdout stays verbatim.
+        # ponytail: remote output decoded with errors=replace (binary-safe);
+        # byte-exact binary output should go through files + kgl get.
+        # Runs via exec in a throwaway namespace so notebook variables are untouched.
+        inner = (
+            "import subprocess,sys\n"
+            "p=subprocess.run(%r,shell=True,capture_output=True)\n"
+            "def d(b):\n"
+            "    try:\n"
+            "        return b.decode('utf-8'),False\n"
+            "    except UnicodeDecodeError:\n"
+            "        return b.decode('utf-8','replace'),True\n"
+            "so,bo=d(p.stdout)\n"
+            "se,be=d(p.stderr)\n"
+            "sys.stdout.write(so)\n"
+            "sys.stderr.write(se)\n"
+            "print(f'[exit {p.returncode} badutf={bo or be}]',file=sys.stderr)\n"
+            ) % sys.argv[2]
+        # repr() embeds the wrapper verbatim (no second string-parse of the
+        # command); exec in a throwaway dict touches no notebook global
+        code = "exec(%s, {})" % repr(inner)
+        import io, contextlib
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = run_code(code, kernel_id=os.environ.get("KGL_KERNEL"))
+        out, err = buf_out.getvalue(), buf_err.getvalue()
+        rc_shell, badutf = 1, False
+        if rc == 0 and "[exit " in err:
+            idx = err.rfind("[exit ")
+            tail = err[idx:].split("]")[0].split()
+            rc_shell = int(tail[1])
+            badutf = "badutf=True" in tail
+            err = err[:idx]  # drop marker suffix exactly; command bytes untouched
+        sys.stdout.write(out)
+        sys.stderr.write(err)
+        if badutf:
+            print("warning: output contained invalid UTF-8 (shown as replacement chars); "
+                  "use kgl put/get files for exact bytes", file=sys.stderr)
+        sys.exit(rc_shell if rc == 0 else rc)
+    if cmd == "get":
+        remote = sys.argv[2]
+        r = api(f"api/contents/{qpath(remote)}?content=1")
+        out = sys.argv[3] if len(sys.argv) > 3 else os.path.basename(remote)
+        if r["format"] == "text":
+            open(out, "w").write(r["content"])
+        elif r["format"] == "json":
+            open(out, "w").write(json.dumps(r["content"], indent=1))
+        elif r["format"] == "base64":
+            open(out, "wb").write(base64.b64decode(r["content"]))
+        else:
+            sys.exit(f"format {r['format']} not supported")
+        print(f"wrote {out} ({os.path.getsize(out)} bytes)")
+        return
+    if cmd == "put":
+        local, remote = sys.argv[2], sys.argv[3]
+        parent = os.path.dirname(remote.strip("/"))
+        for i, _ in enumerate(parent.split("/")) if parent else []:
+            sub = "/".join(parent.split("/")[:i + 1])
+            try:
+                api(f"api/contents/{qpath(sub)}", {"type": "directory"}, "PUT")
+            except SystemExit:
+                pass  # already exists
+        data = open(local, "rb").read()
+        body = {"type": "file", "format": "base64",
+                "content": base64.b64encode(data).decode()}
+        r = api(f"api/contents/{qpath(remote)}", body, "PUT")
+        print("put ok:", r["path"])
+        return
+    if cmd == "term":
+        # Kaggle's jupyter-proxy does not expose the terminado websocket
+        # (/api/terminals/websocket/N always 404s; their "console" is kernel-based).
+        sys.exit("kgl term unsupported: kaggle blocks the terminal websocket; "
+                 "use kgl sh / exec (kernel channel works fine)")
+    sys.exit(f"unknown cmd {cmd}")
+
+
+if __name__ == "__main__":
+    main()
