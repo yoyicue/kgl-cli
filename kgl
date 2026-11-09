@@ -573,46 +573,54 @@ def _headless_action(action, wait=30, timeout=120):
                     return m["result"]["result"].get("value")
             return "no-response"
 
-        def sessions_now():
-            d = _kgl_cookie_api("ListKernelSessions", {})
-            return {s["kernelRunId"] for s in (d or {}).get("sessions", [])}
+        kid = _notebook_kernel_id()  # all verification is bound to this kernel
 
         if action == "stop":
-            before = sessions_now()
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>(b.getAttribute('aria-label')||'')==='Stop session');"
                       "if(!b) return 'no-stop-btn'; b.click(); return 'stop-clicked';})()")
             print(r)
             if "clicked" not in str(r):
                 return 1
-            t0 = time.time()  # verify server-side teardown
+            t0 = time.time()  # verify THIS kernel's sessions are gone server-side
             while time.time() - t0 < timeout:
-                if not (sessions_now() & before):
+                ok, runs = _target_sessions(kid)
+                if ok and not runs:          # confirmed empty — verified
                     print("stopped (verified)")
                     return 0
-                time.sleep(8)
+                time.sleep(8)                # ok=False or still running: keep polling
             print(f"stop not confirmed within {timeout}s", file=sys.stderr)
             return 1
         if action == "run-all":
-            before = sessions_now()
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>/Run All/i.test(b.getAttribute('aria-label')||b.innerText));"
                       "if(!b) return 'no-runall'; b.click(); return 'runall-clicked';})()")
             print(r)
             if "clicked" not in str(r):
                 return 1
-            t0 = time.time()  # verify a session actually spins up
+            t0 = time.time()  # THIS kernel has a session, and its kernel is busy
             while time.time() - t0 < timeout:
-                if sessions_now() - before:
-                    print("session started (verified)")
+                ok, runs = _target_sessions(kid)
+                if ok and runs:
+                    print(f"session up for kernel {kid} (run {min(runs)}) — "
+                          "verify execution with: kgl bootstrap && kgl status")
                     return 0
                 time.sleep(10)
-            print(f"no new session within {timeout}s", file=sys.stderr)
+            print(f"no session for target kernel within {timeout}s", file=sys.stderr)
             return 1
         if action == "save":
-            CK = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-            before = len((_kgl_cookie_api("ListKernelVersions",
-                         {"kernelId": _notebook_kernel_id()}) or {}).get("items", []))
+            kid_now = _notebook_kernel_id()
+            before = None                       # refuse a failed baseline
+            t0 = time.time()
+            while before is None and time.time() - t0 < 30:
+                ok, d = _kgl_cookie_api("ListKernelVersions", {"kernelId": kid_now})
+                if ok and isinstance(d, dict):
+                    before = len(d.get("items", []))
+                else:
+                    time.sleep(5)
+            if before is None:
+                print("cannot establish version-count baseline", file=sys.stderr)
+                return 1
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>/Save Version/.test(b.innerText));"
                       "if(!b) return 'no-save'; b.click(); return 'sv-clicked';})()")
@@ -624,10 +632,10 @@ def _headless_action(action, wait=30, timeout=120):
             print(r, "/", r2)
             if "saved" not in str(r2):
                 return 1
-            t0 = time.time()  # verify a new version lands server-side
+            t0 = time.time()  # verify a new version lands for THIS kernel
             while time.time() - t0 < timeout:
-                d = _kgl_cookie_api("ListKernelVersions", {"kernelId": _notebook_kernel_id()}) or {}
-                if len(d.get("items", [])) > before:
+                ok, d = _kgl_cookie_api("ListKernelVersions", {"kernelId": kid_now})
+                if ok and isinstance(d, dict) and len(d.get("items", [])) > before:
                     print("version saved (verified)")
                     return 0
                 time.sleep(10)
@@ -640,41 +648,59 @@ def _headless_action(action, wait=30, timeout=120):
 
 
 def _kgl_cookie_api(method, body):
-    """kaggle RPC with cached cookies; None on failure (verification polls)."""
+    """kaggle RPC via _post_json (credentials never in argv).
+    Returns (ok, data): ok=False on network/parse/auth failure — callers
+    must treat that as UNKNOWN, never as an empty result."""
     try:
         cookies = _cookie_store()
         CK = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
         xsrf = [p.split("=", 1)[1] for p in CK.split("; ")
                 if p.startswith("XSRF-TOKEN=")]
         if not xsrf:
-            return None
-        out = subprocess.check_output(
-            ["curl", "-s", "--noproxy", "*", "-m", "15",
-             f"https://www.kaggle.com/api/i/kernels.KernelsService/{method}",
-             "-H", "content-type: application/json",
-             "-H", f"x-xsrf-token: {xsrf[0]}", "-b", CK,
-             "-d", json.dumps(body)]).decode()
-        return json.loads(out)
+            return False, None
+        code, out = _post_json(
+            f"https://www.kaggle.com/api/i/kernels.KernelsService/{method}",
+            body, {"x-xsrf-token": xsrf[0], "cookie": CK})
+        if code >= 400 or out is None:
+            return False, None
+        return True, out
     except Exception:
-        return None
+        return False, None
+
+
+def _target_sessions(kid):
+    """(ok, run_ids): sessions belonging to the target kernel only."""
+    ok, d = _kgl_cookie_api("ListKernelSessions", {})
+    if not ok or not isinstance(d, dict):
+        return False, None
+    return True, {s["kernelRunId"] for s in d.get("sessions", [])
+                  if s.get("kernelId") == kid}
 
 
 def _notebook_kernel_id():
-    """kernelId for the configured notebook, resolved from the live session
-    (ListKernelSessions items carry kernelId) and cached."""
+    """kernelId for the configured notebook. Cache is slug-bound: switching
+    ~/.config/kgl/notebook invalidates it."""
+    slug = _notebook_slug()
     cache = os.path.join(CONFDIR, "kernel_id")
     if os.path.exists(cache):
-        v = open(cache).read().strip()
-        if v:
-            return int(v)
-    d = _kgl_cookie_api("ListKernelSessions", {}) or {}
+        parts = open(cache).read().strip().split()
+        if len(parts) == 2 and parts[0] == slug and parts[1].isdigit():
+            return int(parts[1])
+    ok, d = _kgl_cookie_api("ListKernelSessions", {})
+    if not ok or not isinstance(d, dict):
+        sys.exit("cannot resolve kernelId: session list unavailable")
     ss = d.get("sessions", [])
     if not ss:
-        sys.exit("no running session to resolve kernelId; run `kgl session run-all` first")
-    if len({s["kernelId"] for s in ss}) > 1:
-        sys.exit("multiple notebooks have sessions; echo <id> > ~/.config/kgl/kernel_id")
+        sys.exit("no running session to resolve kernelId — seed it once:\n"
+                 f"  echo '{slug} <kernelId>' > ~/.config/kgl/kernel_id\n"
+                 "(kernelId is in the notebook URL's page source, or ListKernelSessions "
+                 "while a session runs)")
+    kids = {s["kernelId"] for s in ss}
+    if len(kids) > 1:
+        sys.exit("multiple notebooks have sessions; "
+                 f"echo '{slug} <id>' > ~/.config/kgl/kernel_id")
     kid = ss[0]["kernelId"]
-    _secure_write(cache, str(kid) + "\n")
+    _secure_write(cache, f"{slug} {kid}\n")
     return kid
 
 
