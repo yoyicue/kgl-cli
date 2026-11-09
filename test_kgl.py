@@ -105,6 +105,13 @@ def t_session_pick():
         check("unknown refuses", False)
     except SystemExit:
         check("unknown refuses", True)
+    # numeric selector never matches a title substring (session-pinning safety)
+    sessions2 = [{"kernelRunId": 222, "title": "experiment-111"}]
+    try:
+        kgl._select_session(sessions2, "111")
+        check("numeric never title-matches", False)
+    except SystemExit:
+        check("numeric never title-matches", True)
     try:
         kgl._select_session([], None)
         check("empty refuses", False)

@@ -225,8 +225,11 @@ def _select_session(sessions, which):
     if not sessions:
         sys.exit("no interactive session; run a cell in the notebook once")
     if which:
-        cand = [s for s in sessions if which.isdigit() and str(s["kernelRunId"]) == which
-                or which.lower() in s.get("title", "").lower()]
+        if which.isdigit():
+            # numeric selector: exact kernelRunId only — never a title substring
+            cand = [s for s in sessions if str(s["kernelRunId"]) == which]
+        else:
+            cand = [s for s in sessions if which.lower() in s.get("title", "").lower()]
     else:
         cand = sessions if len(sessions) == 1 else []
     if len(cand) != 1:
