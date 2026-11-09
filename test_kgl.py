@@ -406,6 +406,124 @@ def t_fs_num():
 t_fs_num()
 
 
+# --- watch: pinned session across re-auth -----------------------------------
+def t_watch_pinned():
+    orig_fb, orig_get = kgl._fb_session, kgl._fs_get
+    seen_sel = []
+    def fake_fb(w=None):
+        seen_sel.append(w)
+        return (222 if len(seen_sel) > 1 else 111), f"doc{len(seen_sel)}", f"t{len(seen_sel)}", None
+    calls = {"n": 0}
+    def fake_get(d, sub, i):
+        calls["n"] += 1
+        if i == "t1":
+            return None, 403  # force re-auth on first read
+        return {"fields": {"status": {"doubleValue": 4}}}, 200
+    kgl._fb_session, kgl._fs_get = fake_fb, fake_get
+    real_time = kgl.time
+    state = {"n": 0}
+    def tick():
+        state["n"] += 1
+        return real_time.time() + (4000 if state["n"] >= 2 else 0)
+    kgl.time = types.SimpleNamespace(
+        time=tick, strftime=real_time.strftime, sleep=lambda s: None)
+    try:
+        rc = kgl.watch(None, 60, once=True)
+        check("re-auth keeps watching (rc 0)", rc == 0, str(rc))
+        check("re-auth pinned to original runId",
+              seen_sel[1] == "111" if len(seen_sel) > 1 else False, str(seen_sel))
+    finally:
+        kgl._fb_session, kgl._fs_get = orig_fb, orig_get
+        kgl.time = real_time
+
+
+t_watch_pinned()
+
+
+# --- watch: missing status field is NOT death --------------------------------
+def t_watch_missing_status():
+    orig_fb, orig_get = kgl._fb_session, kgl._fs_get
+    kgl._fb_session = lambda w=None: (111, "doc", "tok", None)
+    kgl._fs_get = lambda d, sub, i: ({"fields": {"foo": {"doubleValue": 1}}}, 200)
+    try:
+        rc = kgl.watch(None, 60, once=True)
+        check("missing status -> rc 3, not death(2)", rc == 3, str(rc))
+    finally:
+        kgl._fb_session, kgl._fs_get = orig_fb, orig_get
+
+
+t_watch_missing_status()
+
+
+# --- watch: missing metrics shown as unknown, no bogus zero-drop note -------
+def t_watch_missing_metrics(capsys=None):
+    import io, contextlib
+    orig_fb, orig_get = kgl._fb_session, kgl._fs_get
+    kgl._fb_session = lambda w=None: (111, "doc", "tok", None)
+    def fake_get(d, sub, i):
+        if sub == "Status":
+            return {"fields": {"status": {"doubleValue": 4}}}, 200
+        # gpu busy last tick (via closure state), then fields disappear
+        fake_get.busy = getattr(fake_get, "busy", False) or False
+        return {"fields": {"idleTimeoutTime": {"stringValue": "2026-11-09T07:21:35Z"}}}, 200
+    kgl._fs_get = fake_get
+    buf, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = kgl.watch(None, 60, once=True)
+        out = buf.getvalue() + err.getvalue()
+        check("missing metrics -> rc 0 (status was healthy)", rc == 0, str(rc))
+        check("no fake 'dropped to 0%' note", "dropped to 0%" not in out, out[:300])
+        check("warns metrics unavailable", "unavailable" in out, out[:300])
+    finally:
+        kgl._fb_session, kgl._fs_get = orig_fb, orig_get
+
+
+t_watch_missing_metrics()
+
+
+# --- watch: continuous mode reports ResourceUsage failures -------------------
+def t_watch_ru_fail_continuous():
+    import io, contextlib
+    orig_fb, orig_get = kgl._fb_session, kgl._fs_get
+    kgl._fb_session = lambda w=None: (111, "doc", "tok", None)
+    n = {"i": 0}
+    def fake_get(d, sub, i):
+        if sub == "Status":
+            return {"fields": {"status": {"doubleValue": 4}}}, 200
+        return None, 403
+    kgl._fs_get = fake_get
+    real_sleep = kgl.time.sleep
+    kgl.time = types.SimpleNamespace(time=kgl.time.time,
+        strftime=kgl.time.strftime, sleep=lambda s: (_ for _ in ()).throw(KeyboardInterrupt))
+    buf, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            try:
+                kgl.watch(None, 60, once=False)
+            except KeyboardInterrupt:
+                pass
+        check("continuous mode logs RU failure", "ResourceUsage read failed" in err.getvalue(),
+              err.getvalue()[:200])
+    finally:
+        kgl._fb_session, kgl._fs_get = orig_fb, orig_get
+        kgl.time = types.SimpleNamespace(time=kgl.time.time,
+            strftime=kgl.time.strftime, sleep=real_sleep)
+
+
+t_watch_ru_fail_continuous()
+
+
+# --- _fs_num default semantics ------------------------------------------------
+def t_fs_num_missing():
+    check("default MISSING sentinel returned", kgl._fs_num({}) is kgl._MISSING)
+    check("explicit default honored", kgl._fs_num(None, 0) == 0)
+    check("real zero preserved", kgl._fs_num({"doubleValue": 0}) == 0.0)
+
+
+t_fs_num_missing()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")

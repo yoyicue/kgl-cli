@@ -327,8 +327,13 @@ def bootstrap(which=None):
     print("saved:", url[:90] + "…")
 
 
-def _fs_num(v, default=0):
-    """Extract a number from any Firestore Value variant."""
+_MISSING = object()  # sentinel: field absent / unparsable, distinct from real 0
+
+
+def _fs_num(v, default=_MISSING):
+    """Extract a number from any Firestore Value variant.
+    Returns `default` (MISSING by default) when absent/unparsable so callers
+    can distinguish 'no data' from a genuine zero."""
     if not isinstance(v, dict):
         return default
     for k in ("doubleValue", "integerValue", "stringValue"):
@@ -344,15 +349,17 @@ def watch(which=None, interval=60, once=False):
     """Poll Firestore Status + ResourceUsage; alert on session death or idle GPU.
     Re-runs the auth chain when the 1h idToken expires (403)."""
     _run_id, doc, idt, _api = _fb_session(which)
+    pinned_run_id = _run_id  # re-auth must never switch to a different session
     t_mint = time.time()
     print(f"watching (interval {interval}s, Ctrl-C to stop)…", flush=True)
     gpu_was_busy = None
     while True:
         st, code = _fs_get(doc, "Status", idt)
         if code in (401, 403) and time.time() - t_mint > 60:
-            # idToken (1h TTL) expired or revoked -> re-mint the chain once
+            # idToken (1h TTL) expired or revoked -> re-mint the chain once,
+            # pinned to the original kernelRunId
             try:
-                _run_id, doc, idt, _api = _fb_session(which)
+                _run_id, doc, idt, _api = _fb_session(str(pinned_run_id))
                 t_mint = time.time()
                 st, code = _fs_get(doc, "Status", idt)
             except SystemExit as e:
@@ -366,9 +373,17 @@ def watch(which=None, interval=60, once=False):
             time.sleep(interval)
             continue
         f = st.get("fields", {})
-        status = int(_fs_num(f.get("status")))
-        done = int(_fs_num(f.get("doneStatus")))
-        reason = int(_fs_num(f.get("doneReason")))
+        status = _fs_num(f.get("status"))
+        if status is _MISSING:
+            print("Status doc has no parsable status field — response format "
+                  "changed? refusing to guess death", file=sys.stderr, flush=True)
+            if once:
+                return 3
+            time.sleep(interval)
+            continue
+        status = int(status)
+        done = int(_fs_num(f.get("doneStatus"), 0))    # optional display fields
+        reason = int(_fs_num(f.get("doneReason"), 0))
         if status != 4:
             print(f"ALERT: session not RUNNING (status={status} done={done} "
                   f"reason={reason}) — it likely died or was reclaimed", flush=True)
@@ -378,17 +393,29 @@ def watch(which=None, interval=60, once=False):
             f = ru.get("fields", {})
             gpus = [g["mapValue"]["fields"] for g in
                     f.get("gpus", {}).get("arrayValue", {}).get("values", [])]
-            gpu_pct = max((int(_fs_num(g.get("usagePercent"))) for g in gpus), default=0)
-            ram_gb = _fs_num(f.get("ramBytes")) / 1e9
+            gpu_raw = [(_fs_num(g.get("usagePercent"))) for g in gpus]
+            gpu_vals = [int(v) for v in gpu_raw if v is not _MISSING]
+            ram_raw = _fs_num(f.get("ramBytes"))
             idle_at = f.get("idleTimeoutTime", {}).get("stringValue", "?")
-            print(f"[{time.strftime('%H:%M:%S')}] gpu={gpu_pct}% "
-                  f"ram={ram_gb:.1f}GB idle-kill@{idle_at[11:19] if idle_at != '?' else '?'}", flush=True)
-            if gpu_was_busy and gpu_pct == 0:
-                print("NOTE: GPU dropped to 0% — training may have finished or crashed", flush=True)
-            gpu_was_busy = gpu_pct > 0
-        elif once:
-            print("ResourceUsage read failed: " + _auth_err(rcode, ru), file=sys.stderr)
-            return 3
+            if not gpu_vals and ram_raw is _MISSING:
+                print("ResourceUsage doc present but gpu/ram fields missing — "
+                      "metrics unavailable this tick", file=sys.stderr, flush=True)
+            else:
+                gpu_pct = max(gpu_vals) if gpu_vals else None
+                ram_gb = (ram_raw / 1e9) if ram_raw is not _MISSING else None
+                gpu_s = f"{gpu_pct}%" if gpu_pct is not None else "?"
+                ram_s = f"{ram_gb:.1f}GB" if ram_gb is not None else "?"
+                print(f"[{time.strftime('%H:%M:%S')}] gpu={gpu_s} "
+                      f"ram={ram_s} idle-kill@{idle_at[11:19] if idle_at != '?' else '?'}", flush=True)
+                if gpu_pct is not None:
+                    if gpu_was_busy and gpu_pct == 0:
+                        print("NOTE: GPU dropped to 0% — training may have finished or crashed", flush=True)
+                    gpu_was_busy = gpu_pct > 0
+        else:
+            print("ResourceUsage read failed: " + _auth_err(rcode, ru),
+                  file=sys.stderr, flush=True)  # continuous mode: metrics degraded, keep watching
+            if once:
+                return 3
         if once:
             return 0
         time.sleep(interval)
