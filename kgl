@@ -317,16 +317,21 @@ def _fs_get(doc, sub, idt):
         return None, int(code or 0)
 
 
-def bootstrap(which=None):
-    """Pure-HTTP mint of the /k/ route — no browser at all."""
+def _mint_route(which=None):
+    """Run the mint chain and return the /k/ route URL WITHOUT touching the
+    global base file (callers may want a one-off connection context)."""
     _run_id, doc, idt, _api = _fb_session(which)
-
     url_doc, code = _fs_get(doc, "JupyterURL", idt)
     try:
-        url = url_doc["fields"]["url"]["stringValue"]
+        return url_doc["fields"]["url"]["stringValue"].rstrip("/")
     except Exception:
         sys.exit("JupyterURL read: " + _auth_err(code, str(url_doc)[:200]))
-    _secure_write(BASEFILE, url.rstrip("/") + "\n")
+
+
+def bootstrap(which=None):
+    """Pure-HTTP mint of the /k/ route — no browser at all."""
+    url = _mint_route(which)
+    _secure_write(BASEFILE, url + "\n")
     print("saved:", url[:90] + "…")
 
 
@@ -620,23 +625,31 @@ def _headless_action(action, wait=30, timeout=240):
                 if kid is not None:
                     ok, runs = _target_sessions(kid)
                     if ok and runs:
-                        run_id = min(runs)  # kernelRUNid — bootstrap matches on this
-                        try:  # busy on the TARGET session's own jupyter == cells executing
-                            bootstrap(str(run_id))
-                            kernels = api("api/kernels")
-                            note = [k for k in kernels
-                                    if k.get("execution_state") is not None]
-                            states = {k.get("execution_state") for k in note}
-                            if "busy" in states:
-                                print(f"run-all executing (kernel {kid}, run {run_id})")
-                                return 0
-                            # fast cells may finish between polls: accept
-                            # fresh activity on the target's kernel as proof
-                            for k in note:
-                                la = k.get("last_activity", "")
-                                if la and la > "2026" and _iso(la) > t_click:
+                        run_id = min(runs)  # kernelRUNid — mint matches on this
+                        try:
+                            # one-off route: does NOT overwrite the global base
+                            # file (user may be connected to another notebook)
+                            route = _mint_route(str(run_id))
+                            _, kbody = _fetch_json(f"{route}/api/kernels")
+                            _, sbody = _fetch_json(f"{route}/api/sessions")
+                            # target kernel = the notebook's own session kernel;
+                            # another kernel being busy proves nothing
+                            tgt = None
+                            for sess in (sbody or []):
+                                if sess.get("path") == "__notebook_source__.ipynb":
+                                    tgt = sess.get("kernel", {}).get("id")
+                            for k in (kbody or []):
+                                if tgt and k.get("id") != tgt:
+                                    continue  # not the notebook kernel — ignore
+                                if k.get("execution_state") == "busy":
+                                    print(f"run-all executing (kernel {kid}, run {run_id})")
+                                    return 0
+                                # fast cells: THIS kernel's own activity after
+                                # the click is evidence it executed
+                                la = _iso(k.get("last_activity", ""))
+                                if la > t_click:
                                     print(f"run-all executed (kernel {kid}, run {run_id}; "
-                                          "already back to idle — fast cells)")
+                                          "back to idle — fast cells)")
                                     return 0
                         except SystemExit:
                             pass  # route mint flaky; keep polling
@@ -704,6 +717,42 @@ def _kgl_cookie_api(method, body):
         return False, None
 
 
+def _fetch_json(url):
+    """One-off GET returning (code, parsed-json-or-None). URL goes via a 0600
+    curl -K config — it embeds the JWE credential."""
+    import tempfile
+    kf = tempfile.NamedTemporaryFile("w", suffix=".kgl", delete=False)
+    try:
+        try:
+            os.chmod(kf.name, 0o600)
+            kf.write(f'url = "{url}"\n')
+            kf.close()
+        except BaseException:
+            kf.close()
+            os.unlink(kf.name)
+            raise
+        p = None
+        for i in range(3):
+            p = subprocess.run(
+                ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}",
+                 "-K", kf.name], capture_output=True)
+            if p.returncode == 0 and p.stdout:
+                break
+            time.sleep(1)
+    finally:
+        try:
+            os.unlink(kf.name)
+        except FileNotFoundError:
+            pass
+    if not p or not p.stdout:
+        return 0, None
+    out, _, code = p.stdout.decode().rpartition("\n")
+    try:
+        return int(code), json.loads(out) if out else None
+    except ValueError:
+        return int(code or 0), None
+
+
 def _iso(ts):
     """RFC3339 (2026-11-09T12:34:56.789Z) -> epoch seconds; 0 on garbage."""
     try:
@@ -736,7 +785,11 @@ def _notebook_kernel_id(required=True):
             url = ((k or {}).get("url") or "").rstrip("/")
             if ok and url == f"/code/{slug}":
                 return kid
-            os.unlink(cache)  # stale/foreign entry from an older kgl — re-resolve
+            if not ok:
+                # transient API failure: trust the cache rather than deleting
+                # it (deleting could strand a user with no running session)
+                return kid
+            os.unlink(cache)  # CONFIRMED foreign — drop and re-resolve
     ok, d = _kgl_cookie_api("ListKernelSessions", {})
     if not ok or not isinstance(d, dict):
         if required:

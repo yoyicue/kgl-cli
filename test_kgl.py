@@ -687,6 +687,70 @@ def t_iso():
 t_iso()
 
 
+# --- cache kept on transient verify failure, dropped only on confirmed mismatch
+def t_cache_fault_tolerance():
+    orig_slug, orig_api = kgl._notebook_slug, kgl._kgl_cookie_api
+    kgl._notebook_slug = lambda: "owner/target"
+    cache = os.path.join(kgl.CONFDIR, "kernel_id")
+    try:
+        kgl._secure_write(cache, "owner/target 42\n")
+        kgl._kgl_cookie_api = lambda m, b: (False, None)  # transient API failure
+        check("transient failure -> cache kept, kid trusted",
+              kgl._notebook_kernel_id(required=False) == 42)
+        check("cache file still present", os.path.exists(cache))
+    finally:
+        kgl._notebook_slug, kgl._kgl_cookie_api = orig_slug, orig_api
+        if os.path.exists(cache):
+            os.unlink(cache)
+
+
+t_cache_fault_tolerance()
+
+
+# --- _mint_route must NOT touch the global base file ------------------------
+def t_mint_route_no_side_effect():
+    basefile = kgl.BASEFILE
+    kgl._secure_write(basefile, "https://original-route/proxy\n")
+    orig = kgl._fb_session
+    kgl._fb_session = lambda w=None: (1, "doc", "tok", None)
+    orig_get = kgl._fs_get
+    kgl._fs_get = lambda d, sub, i: (
+        {"fields": {"url": {"stringValue": "https://minted-route/proxy"}}}, 200)
+    try:
+        url = kgl._mint_route()
+        check("mint returns url", url == "https://minted-route/proxy")
+        check("global base untouched", open(basefile).read().strip() == "https://original-route/proxy")
+    finally:
+        kgl._fb_session, kgl._fs_get = orig, orig_get
+        os.unlink(basefile)
+
+
+t_mint_route_no_side_effect()
+
+
+# --- _fetch_json: url not in argv --------------------------------------------
+def t_fetch_json_argv():
+    real_run = subprocess.run
+    seen = []
+    def spy(cmd, **kw):
+        seen.append(" ".join(cmd))
+        kw.pop("input", None)
+        r = real_run(["true"], **kw)
+        r.stdout = b'{"k":1}\n200'
+        return r
+    subprocess.run = spy
+    try:
+        code, out = kgl._fetch_json("https://x/JWE-SECRET/proxy/api/kernels")
+        check("fetch parses", code == 200 and out == {"k": 1})
+    finally:
+        subprocess.run = real_run
+    check("JWE url not in argv", "JWE-SECRET" not in seen[0], seen[0][:100])
+    check("fetch uses -K", "-K" in seen[0])
+
+
+t_fetch_json_argv()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")
