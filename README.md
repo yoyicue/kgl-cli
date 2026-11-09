@@ -25,6 +25,7 @@ pip3 install --user --break-system-packages websocket-client   # only dep
 
 ```bash
 kgl bootstrap [title|kernelRunId]   # mint /k/ route (pure HTTP, ~3s)
+kgl watch [sel] [--interval N] [--once]  # poll Firestore: session death/GPU idle alerts
 kgl status                          # kernel + terminal state
 kgl exec "python code"              # run python in the kernel
 kgl sh "shell command"              # run shell; exit code preserved

@@ -236,15 +236,12 @@ def _select_session(sessions, which):
     return cand[0]
 
 
-def bootstrap(which=None):
-    """Pure-HTTP mint of the /k/ route — no browser at all.
+FB_KEY = "AIzaSyD83TRC5oxzFh-vaPb_4X2tHBigTcgkD0Y"  # kkb-production web key
+FS_BASE = "https://firestore.googleapis.com/v1/projects/kkb-production/databases/(default)/documents"
 
-    Chain: kaggle cookies -> GetFirebaseAuthToken -> signInWithCustomToken
-    (kkb-production) -> UpdateUserKernelFirestoreAuth (session doc id)
-    -> Firestore REST read sessions/<doc>/data/JupyterURL.
-    which: session title substring or kernelRunId to disambiguate.
-    """
-    FB_KEY = "AIzaSyD83TRC5oxzFh-vaPb_4X2tHBigTcgkD0Y"  # kkb-production web key
+
+def _fb_session(which=None):
+    """Run the firebase auth chain once. Returns (run_id, doc, idt, kgl_api)."""
     cookies = _cookie_store()
     CK = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
     xsrf = [p.split("=", 1)[1] for p in CK.split("; ") if p.startswith("XSRF-TOKEN=")]
@@ -263,8 +260,7 @@ def bootstrap(which=None):
 
     sessions = kgl_api("ListKernelSessions").get("sessions", [])
     run = _select_session(sessions, which)
-    run_id = run["kernelRunId"]
-    print(f"session: {run['title']} (kernelRunId {run_id})")
+    print(f"session: {run['title']} (kernelRunId {run['kernelRunId']})")
 
     tok = kgl_api("GetFirebaseAuthToken")["authToken"]
     code, out = _post_json(
@@ -275,12 +271,15 @@ def bootstrap(which=None):
     idt = out["idToken"]
 
     upd = kgl_api("UpdateUserKernelFirestoreAuth",
-                  json.dumps({"firebaseIdToken": idt, "kernelRunId": run_id}))
+                  json.dumps({"firebaseIdToken": idt, "kernelRunId": run["kernelRunId"]}))
     doc = upd.get("sessionId")
     if not doc:
         sys.exit("UpdateUserKernelFirestoreAuth returned empty sessionId: " + str(upd)[:150])
+    return run["kernelRunId"], doc, idt, kgl_api
 
-    # GET via -K config (Bearer never in argv), same retry policy
+
+def _fs_get(doc, sub, idt):
+    """GET a sessions/<doc>/data/<sub> Firestore doc via 0600 -K config."""
     import tempfile
     kf = tempfile.NamedTemporaryFile("w", suffix=".kgl", delete=False)
     try:
@@ -296,8 +295,7 @@ def bootstrap(which=None):
         for i in range(3):
             p = subprocess.run(
                 ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}", "-K", kf.name,
-                 f"https://firestore.googleapis.com/v1/projects/kkb-production/databases/(default)/"
-                 f"documents/sessions/{doc}/data/JupyterURL"],
+                 f"{FS_BASE}/sessions/{doc}/data/{sub}"],
                 capture_output=True)
             if p.returncode == 0 and p.stdout:
                 break
@@ -306,15 +304,66 @@ def bootstrap(which=None):
         try:
             os.unlink(kf.name)
         except FileNotFoundError:
-            pass  # already removed by the write-stage handler
-    out, _, code = p.stdout.decode().rpartition("\n") if p and p.stdout else ("", "", "0")
+            pass
+    if not p or not p.stdout:
+        return None, 0
+    out, _, code = p.stdout.decode().rpartition("\n")
     try:
-        url = json.loads(out)["fields"]["url"]["stringValue"]
+        return json.loads(out), int(code)
+    except ValueError:
+        return None, int(code or 0)
+
+
+def bootstrap(which=None):
+    """Pure-HTTP mint of the /k/ route — no browser at all."""
+    _run_id, doc, idt, _api = _fb_session(which)
+
+    url_doc, code = _fs_get(doc, "JupyterURL", idt)
+    try:
+        url = url_doc["fields"]["url"]["stringValue"]
     except Exception:
-        sys.exit("JupyterURL read: " + _auth_err(int(code or 0), out[:200]))
+        sys.exit("JupyterURL read: " + _auth_err(code, str(url_doc)[:200]))
     _secure_write(BASEFILE, url.rstrip("/") + "\n")
     print("saved:", url[:90] + "…")
 
+
+def watch(which=None, interval=60, once=False):
+    """Poll Firestore Status + ResourceUsage; alert on session death or idle GPU."""
+    _run_id, doc, idt, _api = _fb_session(which)
+    print(f"watching (interval {interval}s, Ctrl-C to stop)…", flush=True)
+    gpu_was_busy = None
+    while True:
+        st, code = _fs_get(doc, "Status", idt)
+        if st is None:
+            print("Status read failed: " + _auth_err(code, None), file=sys.stderr)
+        else:
+            f = st.get("fields", {})
+            status = int(f.get("status", {}).get("doubleValue", 0))
+            done = int(f.get("doneStatus", {}).get("doubleValue", 0))
+            reason = int(f.get("doneReason", {}).get("doubleValue", 0))
+            if status != 4:
+                print(f"ALERT: session not RUNNING (status={status} done={done} "
+                      f"reason={reason}) — it likely died or was reclaimed", flush=True)
+                return 2
+        ru, _ = _fs_get(doc, "ResourceUsage", idt)
+        if ru:
+            f = ru.get("fields", {})
+            def s(k):
+                return f.get(k, {}).get("stringValue", "?")
+            gpus = [g["mapValue"]["fields"] for g in
+                    f.get("gpus", {}).get("arrayValue", {}).get("values", [])]
+            gpu_pct = max((int(float(g.get("usagePercent", {}).get("stringValue", 0)))
+                          for g in gpus), default=0)
+            ram_gb = float(s("ramBytes") or 0) / 1e9
+            idle_at = s("idleTimeoutTime")
+            print(f"[{time.strftime('%H:%M:%S')}] gpu={gpu_pct}% "
+                  f"ram={ram_gb:.1f}GB idle-kill@{idle_at[11:19] if idle_at != '?' else '?'}", flush=True)
+            if gpu_was_busy and gpu_pct == 0:
+                print("NOTE: GPU dropped to 0% — training may have finished or crashed", flush=True)
+            gpu_was_busy = gpu_pct > 0
+        if once:
+            return 0
+        time.sleep(interval)
 
 def pick_kernel_id():
     """Kernel of the notebook session, KGL_KERNEL override, else fail loudly."""
@@ -380,11 +429,26 @@ def run_code(code, timeout=600, kernel_id=None):
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: kgl bootstrap|status|exec CODE|sh CMD|get REMOTE [LOCAL]|put LOCAL REMOTE|term", file=sys.stderr)
+        print("usage: kgl bootstrap [sel]|watch [sel] [--interval N] [--once]|status|exec CODE|sh CMD|get REMOTE [LOCAL]|put LOCAL REMOTE", file=sys.stderr)
         sys.exit(1)
     cmd = sys.argv[1]
     if cmd == "bootstrap":
         return bootstrap(sys.argv[2] if len(sys.argv) > 2 else None)
+    if cmd == "watch":
+        # kgl watch [title] [--interval N] [--once]
+        args = sys.argv[2:]
+        interval = 60
+        once = False
+        sel = None
+        it = iter(args)
+        for a in it:
+            if a == "--once":
+                once = True
+            elif a == "--interval":
+                interval = int(next(it))
+            else:
+                sel = a
+        return sys.exit(watch(sel, interval, once))
     if cmd == "status":
         print(json.dumps(api("api/kernels"), indent=1))
         print("terminals:", json.dumps(api("api/terminals")))

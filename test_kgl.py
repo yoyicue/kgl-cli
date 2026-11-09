@@ -278,6 +278,49 @@ def t_api_dump_failure():
 t_api_dump_failure()
 
 
+# --- watch: status!=4 alerts and exits 2 ------------------------------------
+def t_watch_alert():
+    run_id, doc, idt = 111, "doc", "tok"
+    # fake _fb_session and _fs_get: first Status has status 5 (dead)
+    orig_fb, orig_get = kgl._fb_session, kgl._fs_get
+    kgl._fb_session = lambda w=None: (run_id, doc, idt, None)
+    def fake_get(d, sub, i):
+        if sub == "Status":
+            return {"fields": {"status": {"doubleValue": 5},
+                               "doneStatus": {"doubleValue": 2},
+                               "doneReason": {"doubleValue": 3}}}, 200
+        return {"fields": {}}, 200
+    kgl._fs_get = fake_get
+    try:
+        rc = kgl.watch(None, 60, once=True)
+        check("dead session -> rc 2", rc == 2)
+    finally:
+        kgl._fb_session, kgl._fs_get = orig_fb, orig_get
+
+    # healthy: status 4, gpu busy then zero -> note printed, rc 0
+    kgl._fb_session = lambda w=None: (run_id, doc, idt, None)
+    states = iter([
+        ({"fields": {"status": {"doubleValue": 4}}}, 200),
+    ])
+    def fake_get2(d, sub, i):
+        if sub == "Status":
+            return {"fields": {"status": {"doubleValue": 4}}}, 200
+        return {"fields": {
+            "ramBytes": {"stringValue": "8e9"},
+            "gpus": {"arrayValue": {"values": [
+                {"mapValue": {"fields": {"usagePercent": {"stringValue": "0"}}}}]}},
+            "idleTimeoutTime": {"stringValue": "2026-11-09T07:21:35Z"}}}, 200
+    kgl._fs_get = fake_get2
+    try:
+        rc = kgl.watch(None, 60, once=True)
+        check("healthy session -> rc 0", rc == 0)
+    finally:
+        kgl._fb_session, kgl._fs_get = orig_fb, orig_get
+
+
+t_watch_alert()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")
