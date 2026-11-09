@@ -485,9 +485,111 @@ def run_code(code, timeout=600, kernel_id=None):
     return 124
 
 
+def _headless_action(action, wait=30):
+    """Drive the Kaggle editor in headless chrome for browser-gated actions
+    (stop / run-all / save — their RPCs 403 outside a browser context).
+    LARGE viewport required: session controls are hidden below ~1280px."""
+    import subprocess, tempfile, websocket
+    cookies = _cookie_store()
+    proc = subprocess.Popen(
+        ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+         "--headless=new", "--remote-debugging-port=9223",
+         "--user-data-dir=/tmp/chrome-kaggle-headless",
+         "--no-first-run", "--disable-gpu", "--window-size=1920,1080"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(10):
+            try:
+                ver = json.loads(subprocess.check_output(
+                    ["curl", "-s", "--noproxy", "*", "-m", "2",
+                     "http://localhost:9223/json/version"]))
+                break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            sys.exit("headless chrome did not start")
+        ws = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=20,
+                                         suppress_origin=True)
+        ws.send(json.dumps({"id": 1, "method": "Storage.setCookies",
+                            "params": {"cookies": cookies}}))
+        t0 = time.time()
+        while time.time() - t0 < 5:
+            try:
+                if json.loads(ws.recv()).get("id") == 1:
+                    break
+            except websocket.WebSocketTimeoutException:
+                continue
+        subprocess.run(["curl", "-s", "-X", "PUT",
+            "http://localhost:9223/json/new?https://www.kaggle.com/code/"
+            + _notebook_slug() + "/edit"], capture_output=True)
+        time.sleep(wait)
+
+        def click(expr):
+            pws = _edit_tab_ws()
+            pws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                 "params": {"expression": expr, "returnByValue": True}}))
+            t0 = time.time()
+            while time.time() - t0 < 10:
+                try:
+                    m = json.loads(pws.recv())
+                except websocket.WebSocketTimeoutException:
+                    continue
+                if m.get("id") == 1:
+                    pws.close()
+                    return m["result"]["result"].get("value")
+            return None
+
+        if action == "stop":
+            r = click("(()=>{const b=[...document.querySelectorAll('button')]"
+                      ".find(b=>(b.getAttribute('aria-label')||'')==='Stop session');"
+                      "if(!b) return 'no-stop-btn'; b.click(); return 'stop-clicked';})()")
+            print(r or "no response")
+            return
+        if action == "run-all":
+            r = click("(()=>{const b=[...document.querySelectorAll('button')]"
+                      ".find(b=>/Run All/i.test(b.getAttribute('aria-label')||b.innerText));"
+                      "if(!b) return 'no-runall'; b.click(); return 'runall-clicked';})()")
+            print(r or "no response")
+            return
+        if action == "save":
+            r = click("(()=>{const b=[...document.querySelectorAll('button')]"
+                      ".find(b=>/Save Version/.test(b.innerText));"
+                      "if(!b) return 'no-save'; b.click(); return 'sv-clicked';})()")
+            time.sleep(5)
+            r2 = click("(()=>{const bs=[...document.querySelectorAll('button')]"
+                       ".filter(b=>b.innerText.trim()==='Save');"
+                       "if(!bs.length) return 'no-confirm'; bs[bs.length-1].click();"
+                       "return 'saved';})()")
+            print(r, "/", r2)
+            return
+        sys.exit(f"unknown action {action}")
+    finally:
+        proc.terminate()
+
+
+def _notebook_slug():
+    nbfile = os.path.join(CONFDIR, "notebook")
+    if os.path.exists(nbfile):
+        slug = open(nbfile).read().strip()
+        if slug:
+            return slug
+    sys.exit("no notebook configured: echo owner/slug > ~/.config/kgl/notebook")
+
+
+def _edit_tab_ws():
+    import websocket
+    tabs = json.loads(subprocess.check_output(
+        ["curl", "-s", "--noproxy", "*", "http://localhost:9223/json/list"]))
+    tab = next((t for t in tabs if t["type"] == "page" and "kaggle.com" in t["url"]), None)
+    if not tab:
+        sys.exit("edit page did not open (cookies expired? login again)")
+    return websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=30,
+                                       suppress_origin=True)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("usage: kgl bootstrap [sel]|watch [sel] [--interval N] [--once]|status|exec CODE|sh CMD|get REMOTE [LOCAL]|put LOCAL REMOTE", file=sys.stderr)
+        print("usage: kgl bootstrap [sel]|watch [sel] [...]|session stop|run-all|save|status|exec CODE|sh CMD|get REMOTE [LOCAL]|put LOCAL REMOTE", file=sys.stderr)
         sys.exit(1)
     cmd = sys.argv[1]
     if cmd == "bootstrap":
@@ -507,6 +609,10 @@ def main():
             else:
                 sel = a
         return sys.exit(watch(sel, interval, once))
+    if cmd == "session":
+        if len(sys.argv) < 3 or sys.argv[2] not in ("stop", "run-all", "save"):
+            sys.exit("usage: kgl session stop|run-all|save")
+        return _headless_action(sys.argv[2])
     if cmd == "status":
         print(json.dumps(api("api/kernels"), indent=1))
         print("terminals:", json.dumps(api("api/terminals")))
