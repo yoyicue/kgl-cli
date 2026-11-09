@@ -499,7 +499,7 @@ def _chrome_bin():
     sys.exit("no chrome/chromium found; edit _CHROMES in kgl")
 
 
-def _headless_action(action, wait=30, timeout=120):
+def _headless_action(action, wait=30, timeout=240):
     """Drive the Kaggle editor in headless chrome for browser-gated actions
     (stop / run-all / save — their RPCs 403 outside a browser context).
     Returns 0 on VERIFIED success, 1 on failure. Large viewport required:
@@ -573,7 +573,7 @@ def _headless_action(action, wait=30, timeout=120):
                     return m["result"]["result"].get("value")
             return "no-response"
 
-        kid = _notebook_kernel_id()  # all verification is bound to this kernel
+        kid = _notebook_kernel_id(required=action != "run-all")
 
         if action == "stop":
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
@@ -598,15 +598,25 @@ def _headless_action(action, wait=30, timeout=120):
             print(r)
             if "clicked" not in str(r):
                 return 1
-            t0 = time.time()  # THIS kernel has a session, and its kernel is busy
+            # verify: target kernel gains/regains a session AND its kernel goes busy
+            # (an existing session alone proves nothing — the click may not have fired)
+            t0 = time.time()
             while time.time() - t0 < timeout:
-                ok, runs = _target_sessions(kid)
-                if ok and runs:
-                    print(f"session up for kernel {kid} (run {min(runs)}) — "
-                          "verify execution with: kgl bootstrap && kgl status")
-                    return 0
+                kid = _notebook_kernel_id(required=False)  # resolves once a session exists
+                if kid is not None:
+                    ok, runs = _target_sessions(kid)
+                    if ok and runs:
+                        try:  # busy == cells actually executing
+                            bootstrap(str(kid))
+                            states = [k.get("execution_state") for k in api("api/kernels")]
+                            if "busy" in states:
+                                print(f"run-all executing (kernel {kid}, run {min(runs)})")
+                                return 0
+                        except SystemExit:
+                            pass  # route mint flaky; keep polling
                 time.sleep(10)
-            print(f"no session for target kernel within {timeout}s", file=sys.stderr)
+            print(f"execution not confirmed within {timeout}s "
+                  "(no session, or kernel never went busy)", file=sys.stderr)
             return 1
         if action == "save":
             kid_now = _notebook_kernel_id()
@@ -677,9 +687,10 @@ def _target_sessions(kid):
                   if s.get("kernelId") == kid}
 
 
-def _notebook_kernel_id():
-    """kernelId for the configured notebook. Cache is slug-bound: switching
-    ~/.config/kgl/notebook invalidates it."""
+def _notebook_kernel_id(required=True):
+    """kernelId for the configured notebook, verified to BELONG to it via
+    GetKernel's url field. Cache is slug-bound. Returns None when unresolvable
+    and not required (run-all resolves after the click)."""
     slug = _notebook_slug()
     cache = os.path.join(CONFDIR, "kernel_id")
     if os.path.exists(cache):
@@ -688,20 +699,21 @@ def _notebook_kernel_id():
             return int(parts[1])
     ok, d = _kgl_cookie_api("ListKernelSessions", {})
     if not ok or not isinstance(d, dict):
-        sys.exit("cannot resolve kernelId: session list unavailable")
-    ss = d.get("sessions", [])
-    if not ss:
-        sys.exit("no running session to resolve kernelId — seed it once:\n"
-                 f"  echo '{slug} <kernelId>' > ~/.config/kgl/kernel_id\n"
-                 "(kernelId is in the notebook URL's page source, or ListKernelSessions "
-                 "while a session runs)")
-    kids = {s["kernelId"] for s in ss}
-    if len(kids) > 1:
-        sys.exit("multiple notebooks have sessions; "
-                 f"echo '{slug} <id>' > ~/.config/kgl/kernel_id")
-    kid = ss[0]["kernelId"]
-    _secure_write(cache, f"{slug} {kid}\n")
-    return kid
+        if required:
+            sys.exit("cannot resolve kernelId: session list unavailable")
+        return None
+    kids = sorted({s["kernelId"] for s in d.get("sessions", [])})
+    for kid in kids:  # a live session is only a CANDIDATE until verified
+        ok, k = _kgl_cookie_api("GetKernel", {"kernelId": kid})
+        url = ((k or {}).get("url") or "").rstrip("/")
+        if ok and url == f"/code/{slug}":
+            _secure_write(cache, f"{slug} {kid}\n")
+            return kid
+    if required:
+        sys.exit(f"cannot resolve kernelId for {slug}; no session of this notebook "
+                 "is running and the cache is empty — seed it once:\n"
+                 f"  echo '{slug} <kernelId>' > ~/.config/kgl/kernel_id")
+    return None
 
 
 def _notebook_slug():

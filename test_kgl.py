@@ -600,6 +600,56 @@ def t_kernel_cache_slug_bound():
 t_kernel_cache_slug_bound()
 
 
+# --- kid resolver: ownership via GetKernel url; lazy for run-all ------------
+def t_kid_resolver():
+    orig_slug = kgl._notebook_slug
+    orig_api = kgl._kgl_cookie_api
+    kgl._notebook_slug = lambda: "owner/target"
+    calls = {"GetKernel": []}
+
+    def fake_api(m, b):
+        if m == "ListKernelSessions":
+            return True, {"sessions": [{"kernelId": 999, "kernelRunId": 5}]}
+        if m == "GetKernel":
+            calls["GetKernel"].append(b.get("kernelId"))
+            return True, {"url": "/code/someone/ELSE"}  # belongs to another notebook
+        return True, {}
+
+    kgl._kgl_cookie_api = fake_api
+    try:
+        # candidate session is NOT ours -> lazy resolve returns None (no crash)
+        check("foreign session -> None when not required",
+              kgl._notebook_kernel_id(required=False) is None)
+        # ...and a clear error when required
+        try:
+            kgl._notebook_kernel_id(required=True)
+            check("foreign session -> refuses when required", False)
+        except SystemExit as e:
+            check("foreign session -> refuses when required", "seed" in str(e))
+        check("GetKernel was consulted", 999 in calls["GetKernel"])
+
+        # matching url -> resolved + cached
+        def fake_api2(m, b):
+            if m == "ListKernelSessions":
+                return True, {"sessions": [{"kernelId": 999, "kernelRunId": 5}]}
+            if m == "GetKernel":
+                return True, {"url": "/code/owner/target"}
+            return True, {}
+        kgl._kgl_cookie_api = fake_api2
+        kid = kgl._notebook_kernel_id(required=False)
+        check("own session -> resolved", kid == 999, str(kid))
+        cache = os.path.join(kgl.CONFDIR, "kernel_id")
+        check("resolved kid cached slug-bound",
+              open(cache).read().strip() == "owner/target 999")
+        os.unlink(cache)
+    finally:
+        kgl._notebook_slug = orig_slug
+        kgl._kgl_cookie_api = orig_api
+
+
+t_kid_resolver()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")
