@@ -355,14 +355,14 @@ def watch(which=None, interval=60, once=False):
         ru, _ = _fs_get(doc, "ResourceUsage", idt)
         if ru:
             f = ru.get("fields", {})
-            def s(k):
-                return f.get(k, {}).get("stringValue", "?")
+            def s(k, default="0"):
+                return f.get(k, {}).get("stringValue", default)
             gpus = [g["mapValue"]["fields"] for g in
                     f.get("gpus", {}).get("arrayValue", {}).get("values", [])]
             gpu_pct = max((int(float(g.get("usagePercent", {}).get("stringValue", 0)))
                           for g in gpus), default=0)
             ram_gb = float(s("ramBytes") or 0) / 1e9
-            idle_at = s("idleTimeoutTime")
+            idle_at = s("idleTimeoutTime", "?")
             print(f"[{time.strftime('%H:%M:%S')}] gpu={gpu_pct}% "
                   f"ram={ram_gb:.1f}GB idle-kill@{idle_at[11:19] if idle_at != '?' else '?'}", flush=True)
             if gpu_was_busy and gpu_pct == 0:

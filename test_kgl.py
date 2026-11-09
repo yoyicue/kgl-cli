@@ -337,8 +337,13 @@ def t_watch_token_refresh():
     kgl._fb_session, kgl._fs_get = fake_fb, fake_get
     # make the code believe the token was minted >3000s ago
     real_time = kgl.time
+    ticks = iter([])  # placeholder; use growing offset below
+    state = {"n": 0}
+    def fake_now():
+        state["n"] += 1
+        return real_time.time() + (4000 if state["n"] > 1 else 0)
     kgl.time = types.SimpleNamespace(
-        time=lambda: real_time.time() + 4000,
+        time=fake_now,
         strftime=real_time.strftime, sleep=lambda s: None)
     try:
         rc = kgl.watch(None, 60, once=True)
