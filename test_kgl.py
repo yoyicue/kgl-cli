@@ -650,6 +650,43 @@ def t_kid_resolver():
 t_kid_resolver()
 
 
+# --- cached kid must be ownership-verified (legacy wrong binding) -----------
+def t_kid_cache_verified():
+    orig_slug, orig_api = kgl._notebook_slug, kgl._kgl_cookie_api
+    kgl._notebook_slug = lambda: "owner/target"
+    cache = os.path.join(kgl.CONFDIR, "kernel_id")
+    try:
+        # legacy cache: bound to our slug but the kid belongs to ANOTHER notebook
+        kgl._secure_write(cache, "owner/target 42\n")
+        kgl._kgl_cookie_api = lambda m, b: (
+            (True, {"url": "/code/someone/ELSE"}) if m == "GetKernel" else
+            (True, {"sessions": []}))
+        check("stale cache dropped, not trusted",
+              kgl._notebook_kernel_id(required=False) is None)
+        check("stale cache file removed", not os.path.exists(cache))
+
+        # valid cache: GetKernel confirms -> returned without re-resolution
+        kgl._secure_write(cache, "owner/target 42\n")
+        kgl._kgl_cookie_api = lambda m, b: (True, {"url": "/code/owner/target"})
+        check("verified cache honored", kgl._notebook_kernel_id(required=False) == 42)
+    finally:
+        kgl._notebook_slug, kgl._kgl_cookie_api = orig_slug, orig_api
+        if os.path.exists(cache):
+            os.unlink(cache)
+
+
+t_kid_cache_verified()
+
+
+# --- _iso parses RFC3339 ------------------------------------------------------
+def t_iso():
+    check("_iso epoch", abs(kgl._iso("2026-11-09T12:00:00Z") - 1794254400) < 86400)
+    check("_iso garbage", kgl._iso("junk") == 0)
+
+
+t_iso()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")

@@ -613,21 +613,34 @@ def _headless_action(action, wait=30, timeout=240):
                 return 1
             # verify: target kernel gains/regains a session AND its kernel goes busy
             # (an existing session alone proves nothing — the click may not have fired)
-            t0 = time.time()
+            t_click = time.time()
+            t0 = t_click
             while time.time() - t0 < timeout:
                 kid = _notebook_kernel_id(required=False)  # resolves once a session exists
                 if kid is not None:
                     ok, runs = _target_sessions(kid)
                     if ok and runs:
-                        try:  # busy == cells actually executing
-                            bootstrap(str(kid))
-                            states = [k.get("execution_state") for k in api("api/kernels")]
+                        run_id = min(runs)  # kernelRUNid — bootstrap matches on this
+                        try:  # busy on the TARGET session's own jupyter == cells executing
+                            bootstrap(str(run_id))
+                            kernels = api("api/kernels")
+                            note = [k for k in kernels
+                                    if k.get("execution_state") is not None]
+                            states = {k.get("execution_state") for k in note}
                             if "busy" in states:
-                                print(f"run-all executing (kernel {kid}, run {min(runs)})")
+                                print(f"run-all executing (kernel {kid}, run {run_id})")
                                 return 0
+                            # fast cells may finish between polls: accept
+                            # fresh activity on the target's kernel as proof
+                            for k in note:
+                                la = k.get("last_activity", "")
+                                if la and la > "2026" and _iso(la) > t_click:
+                                    print(f"run-all executed (kernel {kid}, run {run_id}; "
+                                          "already back to idle — fast cells)")
+                                    return 0
                         except SystemExit:
                             pass  # route mint flaky; keep polling
-                time.sleep(10)
+                time.sleep(5)
             print(f"execution not confirmed within {timeout}s "
                   "(no session, or kernel never went busy)", file=sys.stderr)
             return 1
@@ -691,6 +704,15 @@ def _kgl_cookie_api(method, body):
         return False, None
 
 
+def _iso(ts):
+    """RFC3339 (2026-11-09T12:34:56.789Z) -> epoch seconds; 0 on garbage."""
+    try:
+        from datetime import datetime, timezone
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+
+
 def _target_sessions(kid):
     """(ok, run_ids): sessions belonging to the target kernel only."""
     ok, d = _kgl_cookie_api("ListKernelSessions", {})
@@ -709,7 +731,12 @@ def _notebook_kernel_id(required=True):
     if os.path.exists(cache):
         parts = open(cache).read().strip().split()
         if len(parts) == 2 and parts[0] == slug and parts[1].isdigit():
-            return int(parts[1])
+            kid = int(parts[1])
+            ok, k = _kgl_cookie_api("GetKernel", {"kernelId": kid})
+            url = ((k or {}).get("url") or "").rstrip("/")
+            if ok and url == f"/code/{slug}":
+                return kid
+            os.unlink(cache)  # stale/foreign entry from an older kgl — re-resolve
     ok, d = _kgl_cookie_api("ListKernelSessions", {})
     if not ok or not isinstance(d, dict):
         if required:
