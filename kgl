@@ -25,9 +25,14 @@ def curl(url, body=None, method=None):
     import tempfile
     kf = tempfile.NamedTemporaryFile("w", suffix=".kgl", delete=False)
     try:
-        os.chmod(kf.name, 0o600)
-        kf.write(f'url = "{url}"\n')
-        kf.close()
+        try:
+            os.chmod(kf.name, 0o600)
+            kf.write(f'url = "{url}"\n')
+            kf.close()
+        except BaseException:
+            kf.close()
+            os.unlink(kf.name)
+            raise
         cmd = ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}", "-K", kf.name]
         if body is not None:
             cmd += ["-X", method or "POST", "--data-binary", "@" + body]
@@ -131,6 +136,10 @@ def _cookie_store():
         except Exception:
             pass
     if cached:
+        try:
+            os.chmod(cookiefile, 0o600)  # tighten pre-existing cache
+        except OSError:
+            pass
         return cached
     if os.path.exists(cookiefile):
         return json.load(open(cookiefile))
@@ -154,11 +163,16 @@ def _post_json(url, body_obj, headers):
     (nothing secret in argv / process list). Returns (code, json-or-None)."""
     import tempfile
     kf = tempfile.NamedTemporaryFile("w", suffix=".kgl", delete=False)
-    os.chmod(kf.name, 0o600)
-    for h, v in headers.items():
-        kf.write(f'header = "{h}: {v}"\n')
-    kf.close()
     try:
+        try:
+            os.chmod(kf.name, 0o600)
+            for h, v in headers.items():
+                kf.write(f'header = "{h}: {v}"\n')
+            kf.close()
+        except BaseException:
+            kf.close()
+            os.unlink(kf.name)
+            raise
         p = None
         for i in range(3):  # ponytail: local route to kaggle is flaky; retry transient failures
             p = subprocess.run(
@@ -258,10 +272,15 @@ def bootstrap(which=None):
     # GET via -K config (Bearer never in argv), same retry policy
     import tempfile
     kf = tempfile.NamedTemporaryFile("w", suffix=".kgl", delete=False)
-    os.chmod(kf.name, 0o600)
-    kf.write(f'header = "Authorization: Bearer {idt}"\n')
-    kf.close()
     try:
+        try:
+            os.chmod(kf.name, 0o600)
+            kf.write(f'header = "Authorization: Bearer {idt}"\n')
+            kf.close()
+        except BaseException:
+            kf.close()
+            os.unlink(kf.name)
+            raise
         p = None
         for i in range(3):
             p = subprocess.run(
