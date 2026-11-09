@@ -581,6 +581,19 @@ def _headless_action(action, wait=30, timeout=240):
                       "if(!b) return 'no-stop-btn'; b.click(); return 'stop-clicked';})()")
             print(r)
             if "clicked" not in str(r):
+                # error-state sessions expose no stop control — say so instead
+                # of failing silently
+                pill = click("(()=>{const p=[...document.querySelectorAll('button')]"
+                             ".find(b=>/Session/i.test(b.innerText)); return p?"
+                             "p.innerText.replace(/\\n/g,' ').slice(0,60):'no-pill';})()")
+                ok, runs = _target_sessions(kid)
+                if "Error" in str(pill):
+                    print(f"session is in ERROR state ({pill}); no stop control "
+                          "offered — Kaggle usually reaps it; check "
+                          "`kgl watch` or the web UI", file=sys.stderr)
+                elif ok and not runs:
+                    print("no session running for this notebook — nothing to stop")
+                    return 0
                 return 1
             t0 = time.time()  # verify THIS kernel's sessions are gone server-side
             while time.time() - t0 < timeout:
