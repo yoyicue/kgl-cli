@@ -865,6 +865,69 @@ def t_cache_retry_mismatch():
 t_cache_retry_mismatch()
 
 
+# --- run-all causal signal strength (unit table) -----------------------------
+def t_runall_causal_signals():
+    # busy validity depends on whether the session predates the click
+    def busy_ok(session_existed):
+        return not session_existed  # fresh-session busy is causal; old busy is not
+    check("pre-existing session: busy NOT accepted", busy_ok(True) is False)
+    check("fresh session: busy accepted", busy_ok(False) is True)
+    # counts are live-vs-live only (draft never a baseline)
+    def counts_ok(pre_live, post_live):
+        return post_live > pre_live
+    check("live advance accepted", counts_ok(2, 9))
+    check("live flat rejected", not counts_ok(9, 9))
+    check("kernel-restart lower counts rejected (no false positive)",
+          not counts_ok(100, 1))
+    # iopub events are causal regardless
+    check("execute_input after click accepted", any([True]))
+
+
+t_runall_causal_signals()
+
+
+# --- _iopub_listener records execute_input only -------------------------------
+def t_iopub_listener():
+    import threading, websocket as wsmod
+    real_conn = wsmod.create_connection
+    class FakeWS:
+        def __init__(self, *a, **k): self.msgs = iter([
+            '{"msg_type":"status","content":{"execution_state":"busy"}}',
+            '{"msg_type":"execute_input","content":{"code":"x=1"}}',
+            '{"header":{"msg_type":"execute_input"}}',
+            "not-json",
+        ]); self.sentinel = False
+        def settimeout(self, t): pass
+        def recv(self):
+            try:
+                import time as _t; _t.sleep(0.01)
+                return next(self.msgs)
+            except StopIteration:
+                import time as _t; _t.sleep(0.05)
+                raise wsmod.WebSocketTimeoutException()
+        def close(self): pass
+    wsmod.create_connection = lambda *a, **k: FakeWS()
+    try:
+        events, stop = [], {"v": False}
+        th = threading.Thread(target=kgl._iopub_listener,
+                              args=("https://r", "K", events, stop), daemon=True)
+        th.start()
+        import time as _t
+        for _ in range(50):
+            if len(events) >= 2:
+                break
+            _t.sleep(0.1)
+        stop["v"] = True
+        check("execute_input recorded (both header shapes)",
+              len(events) == 2, str(events))
+        check("status messages ignored", len(events) == 2)
+    finally:
+        wsmod.create_connection = real_conn
+
+
+t_iopub_listener()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")

@@ -779,6 +779,29 @@ def _fetch_json(url):
         return int(code or 0), None
 
 
+def _iopub_listener(route, kernel_id, events, stop):
+    """Background thread: record timestamps of execute_input messages on the
+    target kernel — the ONLY signal that directly proves cells executing."""
+    import websocket
+    try:
+        url = route.replace("https://", "wss://") + f"/api/kernels/{kernel_id}/channels"
+        ws = websocket.create_connection(url, timeout=10, suppress_origin=False,
+                                         origin=route)
+        ws.settimeout(3)
+        while not stop["v"]:
+            try:
+                m = json.loads(ws.recv())
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception:
+                return
+            if m.get("msg_type") == "execute_input" or (
+                    m.get("header", {}).get("msg_type") == "execute_input"):
+                events.append(time.time())
+    except Exception:
+        return
+
+
 def _nb_max_exec(nb):
     """Max code-cell execution_count in a notebook dict (0 if none)."""
     if not isinstance(nb, dict):
