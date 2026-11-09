@@ -10,7 +10,7 @@ for k in list(os.environ):
 
 CONFDIR = os.path.expanduser("~/.config/kgl")
 BASEFILE = os.path.join(CONFDIR, "base")
-os.makedirs(CONFDIR, exist_ok=True)
+os.makedirs(CONFDIR, mode=0o700, exist_ok=True)
 
 import urllib.request
 
@@ -114,6 +114,7 @@ def _cookie_store():
                         capture_output=True, text=True).stdout
                     if '"userId"' in out or '"user"' in out:
                         json.dump(slim, open(cookiefile, "w"))
+                        os.chmod(cookiefile, 0o600)
                         return slim
         except Exception:
             pass
@@ -125,60 +126,135 @@ def _cookie_store():
              + cookiefile)
 
 
-def bootstrap():
+def _secure_write(path, data):
+    """Write with 0600 — cookies/base hold live credentials."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, data if isinstance(data, bytes) else data.encode())
+    os.close(fd)
+
+
+def _post_json(url, body_obj, headers):
+    """POST via curl; credentials via 0600 -K config file and stdin body
+    (nothing secret in argv / process list). Returns (code, json-or-None)."""
+    import tempfile
+    kf = tempfile.NamedTemporaryFile("w", suffix=".kgl", delete=False)
+    os.chmod(kf.name, 0o600)
+    for h, v in headers.items():
+        kf.write(f'header = "{h}: {v}"\n')
+    kf.close()
+    p = None
+    for i in range(3):  # ponytail: local route to kaggle is flaky; retry transient failures
+        p = subprocess.run(
+            ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}",
+             "-K", kf.name, url, "-H", "content-type: application/json",
+             "--data-binary", "@-"],
+            input=json.dumps(body_obj).encode(), capture_output=True)
+        if p.returncode == 0 and p.stdout:
+            break
+        time.sleep(1)
+    os.unlink(kf.name)
+    if p is None or p.returncode != 0:
+        return 0, None
+    out, _, code = p.stdout.decode().rpartition("\n")
+    try:
+        return int(code), json.loads(out) if out else None
+    except ValueError:
+        return int(code or 0), None
+
+
+def _auth_err(code, body):
+    """Map HTTP failures to actionable messages."""
+    err = body.get("error") if isinstance(body, dict) else None
+    perm = isinstance(err, dict) and err.get("status") == "PERMISSION_DENIED"
+    if code == 403 or perm:
+        return ("auth failed (403): kaggle cookies expired — re-login in any "
+                "chrome and re-run with 9222 debugging on, or refresh "
+                "~/.config/kgl/cookies.json")
+    if code == 404:
+        return f"not found (404): {str(body)[:150]}"
+    if code == 0:
+        return f"network failure: {str(body)[:150]}"
+    return f"HTTP {code}: {str(body)[:200]}"
+
+
+def bootstrap(which=None):
     """Pure-HTTP mint of the /k/ route — no browser at all.
 
     Chain: kaggle cookies -> GetFirebaseAuthToken -> signInWithCustomToken
     (kkb-production) -> UpdateUserKernelFirestoreAuth (session doc id)
     -> Firestore REST read sessions/<doc>/data/JupyterURL.
+    which: session title substring or kernelRunId to disambiguate.
     """
     FB_KEY = "AIzaSyD83TRC5oxzFh-vaPb_4X2tHBigTcgkD0Y"  # kkb-production web key
-    CK = "; ".join(f"{c['name']}={c['value']}" for c in _cookie_store())
-    XSRF = [p.split("=", 1)[1] for p in CK.split("; ") if p.startswith("XSRF-TOKEN=")][0]
+    cookies = _cookie_store()
+    CK = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    xsrf = [p.split("=", 1)[1] for p in CK.split("; ") if p.startswith("XSRF-TOKEN=")]
+    if not xsrf:
+        sys.exit("cookies have no XSRF-TOKEN — expired? re-login to kaggle "
+                 "and refresh ~/.config/kgl/cookies.json")
+    XSRF = xsrf[0]
 
     def kgl_api(method, body="{}"):
-        out = subprocess.check_output(
-            ["curl", "-s", "--noproxy", "*", "-m", "20",
-             f"https://www.kaggle.com/api/i/kernels.KernelsService/{method}",
-             "-H", "content-type: application/json",
-             "-H", f"x-xsrf-token: {XSRF}", "-b", CK, "-d", body]).decode()
-        try:
-            return json.loads(out)
-        except Exception:
-            sys.exit(f"{method} failed: {out[:200]}")
+        code, out = _post_json(
+            f"https://www.kaggle.com/api/i/kernels.KernelsService/{method}",
+            json.loads(body), {"x-xsrf-token": XSRF, "cookie": CK})
+        if code >= 400 or out is None:
+            sys.exit(f"{method}: " + _auth_err(code, out))
+        return out
 
     sessions = kgl_api("ListKernelSessions").get("sessions", [])
     if not sessions:
         sys.exit("no interactive session; run a cell in the notebook once")
-    run = max(sessions, key=lambda s: s.get("dateCreated", ""))
+    if which:
+        cand = [s for s in sessions if which.isdigit() and str(s["kernelRunId"]) == which
+                or which.lower() in s.get("title", "").lower()]
+    else:
+        cand = sessions if len(sessions) == 1 else []
+    if len(cand) != 1:
+        sys.exit("ambiguous/unknown session — pick one:\n" +
+                 "\n".join(f'  kgl bootstrap "{s["title"]}"   (kernelRunId {s["kernelRunId"]})'
+                           for s in sessions))
+    run = cand[0]
     run_id = run["kernelRunId"]
     print(f"session: {run['title']} (kernelRunId {run_id})")
 
     tok = kgl_api("GetFirebaseAuthToken")["authToken"]
-    out = subprocess.check_output(
-        ["curl", "-s", "--noproxy", "*", "-m", "20",
-         f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={FB_KEY}",
-         "-H", "content-type: application/json",
-         "-d", json.dumps({"token": tok, "returnSecureToken": True})]).decode()
-    idt = json.loads(out).get("idToken")
-    if not idt:
-        sys.exit("firebase signIn failed: " + out[:200])
+    code, out = _post_json(
+        f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={FB_KEY}",
+        {"token": tok, "returnSecureToken": True}, {})
+    if code >= 400 or not (out or {}).get("idToken"):
+        sys.exit("firebase signIn: " + _auth_err(code, out))
+    idt = out["idToken"]
 
-    doc = kgl_api("UpdateUserKernelFirestoreAuth",
-                  json.dumps({"firebaseIdToken": idt, "kernelRunId": run_id}))["sessionId"]
+    upd = kgl_api("UpdateUserKernelFirestoreAuth",
+                  json.dumps({"firebaseIdToken": idt, "kernelRunId": run_id}))
+    doc = upd.get("sessionId")
     if not doc:
-        sys.exit("UpdateUserKernelFirestoreAuth returned empty sessionId")
+        sys.exit("UpdateUserKernelFirestoreAuth returned empty sessionId: " + str(upd)[:150])
 
-    out = subprocess.check_output(
-        ["curl", "-s", "--noproxy", "*", "-m", "20",
-         f"https://firestore.googleapis.com/v1/projects/kkb-production/databases/(default)/"
-         f"documents/sessions/{doc}/data/JupyterURL",
-         "-H", f"Authorization: Bearer {idt}"]).decode()
+    # GET via -K config (Bearer never in argv), same retry policy
+    import tempfile
+    kf = tempfile.NamedTemporaryFile("w", suffix=".kgl", delete=False)
+    os.chmod(kf.name, 0o600)
+    kf.write(f'header = "Authorization: Bearer {idt}"\n')
+    kf.close()
+    p = None
+    for i in range(3):
+        p = subprocess.run(
+            ["curl", "-s", "--noproxy", "*", "-m", "20", "-w", "\n%{http_code}", "-K", kf.name,
+             f"https://firestore.googleapis.com/v1/projects/kkb-production/databases/(default)/"
+             f"documents/sessions/{doc}/data/JupyterURL"],
+            capture_output=True)
+        if p.returncode == 0 and p.stdout:
+            break
+        time.sleep(1)
+    os.unlink(kf.name)
+    out, _, code = p.stdout.decode().rpartition("\n") if p and p.stdout else ("", "", "0")
     try:
         url = json.loads(out)["fields"]["url"]["stringValue"]
     except Exception:
-        sys.exit("JupyterURL read failed: " + out[:300])
-    open(BASEFILE, "w").write(url.rstrip("/"))
+        sys.exit("JupyterURL read: " + _auth_err(int(code or 0), out[:200]))
+    _secure_write(BASEFILE, url.rstrip("/") + "\n")
     print("saved:", url[:90] + "…")
 
 
@@ -250,7 +326,7 @@ def main():
         sys.exit(1)
     cmd = sys.argv[1]
     if cmd == "bootstrap":
-        return bootstrap()
+        return bootstrap(sys.argv[2] if len(sys.argv) > 2 else None)
     if cmd == "status":
         print(json.dumps(api("api/kernels"), indent=1))
         print("terminals:", json.dumps(api("api/terminals")))
