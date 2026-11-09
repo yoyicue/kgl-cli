@@ -328,12 +328,19 @@ def bootstrap(which=None):
 
 
 def watch(which=None, interval=60, once=False):
-    """Poll Firestore Status + ResourceUsage; alert on session death or idle GPU."""
+    """Poll Firestore Status + ResourceUsage; alert on session death or idle GPU.
+    Re-runs the auth chain when the 1h idToken expires (403)."""
     _run_id, doc, idt, _api = _fb_session(which)
+    t_mint = time.time()
     print(f"watching (interval {interval}s, Ctrl-C to stop)…", flush=True)
     gpu_was_busy = None
     while True:
         st, code = _fs_get(doc, "Status", idt)
+        if code == 403 and time.time() - t_mint > 3000:
+            # idToken (1h TTL) expired -> re-mint the whole chain
+            _run_id, doc, idt, _api = _fb_session(which)
+            t_mint = time.time()
+            st, code = _fs_get(doc, "Status", idt)
         if st is None:
             print("Status read failed: " + _auth_err(code, None), file=sys.stderr)
         else:

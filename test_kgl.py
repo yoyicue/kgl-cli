@@ -321,6 +321,37 @@ def t_watch_alert():
 t_watch_alert()
 
 
+# --- watch: 403 after 1h re-mints the auth chain ----------------------------
+def t_watch_token_refresh():
+    orig_fb, orig_get = kgl._fb_session, kgl._fs_get
+    calls = {"fb": 0, "get": 0}
+    def fake_fb(w=None):
+        calls["fb"] += 1
+        return 111, f"doc{calls['fb']}", f"tok{calls['fb']}", None
+    def fake_get(d, sub, i):
+        calls["get"] += 1
+        # first call with tok1 -> 403 (expired); after re-mint tok2 -> healthy
+        if i == "tok1":
+            return None, 403
+        return {"fields": {"status": {"doubleValue": 4}}}, 200
+    kgl._fb_session, kgl._fs_get = fake_fb, fake_get
+    # make the code believe the token was minted >3000s ago
+    real_time = kgl.time
+    kgl.time = types.SimpleNamespace(
+        time=lambda: real_time.time() + 4000,
+        strftime=real_time.strftime, sleep=lambda s: None)
+    try:
+        rc = kgl.watch(None, 60, once=True)
+        check("403 -> re-mint -> rc 0", rc == 0)
+        check("auth chain ran twice", calls["fb"] == 2, str(calls))
+    finally:
+        kgl._fb_session, kgl._fs_get = orig_fb, orig_get
+        kgl.time = real_time
+
+
+t_watch_token_refresh()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")
