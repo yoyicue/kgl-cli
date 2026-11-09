@@ -66,31 +66,131 @@ def api(path, obj=None, method=None):
         sys.exit(f"bad json (HTTP {code}): {out[:200]}")
 
 
-def bootstrap():
-    import websocket
-    tabs = json.loads(subprocess.check_output(["curl", "-s", "--noproxy", "*",
-                    "http://localhost:9222/json/list"]))
-    try:
-        frame = next(t for t in tabs if t["type"] == "iframe" and "jupyter-proxy" in t["url"])
-    except StopIteration:
-        sys.exit("open the notebook edit page in the 9222 chrome first")
-    ws = websocket.create_connection(frame["webSocketDebuggerUrl"], timeout=30, suppress_origin=True)
-    ws.send(json.dumps({"id": 1, "method": "Network.enable"}))
-    ws.send(json.dumps({"id": 2, "method": "Page.reload"}))
+def _cdp_call(ws, method, params=None, want_id=None, timeout=10):
+    import websocket as _w
+    i = want_id or 1
+    ws.send(json.dumps({"id": i, "method": method, "params": params or {}}))
     t0 = time.time()
-    while time.time() - t0 < 20:
+    while time.time() - t0 < timeout:
         try:
             m = json.loads(ws.recv())
-        except websocket.WebSocketTimeoutException:
+        except _w.WebSocketTimeoutException:
             continue
-        if m.get("method") == "Network.requestWillBeSent":
-            u = m["params"]["request"]["url"]
-            if "/proxy/api/" in u:
-                b = u.split("/proxy/")[0] + "/proxy"
-                open(BASEFILE, "w").write(b)
-                print("saved:", b[:80] + "…")
-                return
-    sys.exit("bootstrap failed: no /proxy/api request seen")
+        if m.get("id") == i:
+            return m
+    return None
+
+
+def _cookie_store():
+    """Kaggle cookies: cached locally, refreshed from the 9222 browser if present."""
+    cookiefile = os.path.join(CONFDIR, "cookies.json")
+    src_browser = None
+    try:
+        ver = json.loads(subprocess.check_output(
+            ["curl", "-s", "--noproxy", "*", "-m", "3", "http://localhost:9222/json/version"]))
+        src_browser = ver["webSocketDebuggerUrl"]
+    except Exception:
+        pass
+    if src_browser:
+        import websocket
+        ws = websocket.create_connection(src_browser, timeout=15, suppress_origin=True)
+        r = _cdp_call(ws, "Storage.getCookies")
+        cks = [c for c in (r["result"]["cookies"] if r else []) if "kaggle" in c["domain"]]
+        if cks:
+            KEYS = ("name", "value", "domain", "path", "secure", "httpOnly", "sameSite", "expires")
+            slim = [{k: c[k] for k in KEYS if c.get(k) is not None} for c in cks]
+            json.dump(slim, open(cookiefile, "w"))
+            return slim
+    if os.path.exists(cookiefile):
+        return json.load(open(cookiefile))
+    sys.exit("no kaggle cookies: open 9222 chrome once, or put cookies in "
+             + cookiefile)
+
+
+def bootstrap(note_arg=None):
+    """Fully scripted: headless chrome mints the /k/ route. No visible window."""
+    import subprocess, threading, websocket
+    cookies = _cookie_store()
+    port, prof = "9223", "/tmp/chrome-kaggle-headless"
+    subprocess.run(["pkill", "-f", "chrome-kaggle-headless"], capture_output=True)
+    time.sleep(0.5)
+    chrome = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    proc = subprocess.Popen([chrome, "--headless=new", f"--remote-debugging-port={port}",
+        f"--user-data-dir={prof}", "--no-first-run", "--disable-gpu"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(10):
+            try:
+                ver = json.loads(subprocess.check_output(
+                    ["curl", "-s", "--noproxy", "*", "-m", "2", f"http://localhost:{port}/json/version"]))
+                break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            sys.exit("headless chrome did not start")
+        bws = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=90, suppress_origin=True)
+        bws.send(json.dumps({"id": 1, "method": "Storage.setCookies", "params": {"cookies": cookies}}))
+        t0 = time.time()
+        while time.time() - t0 < 5:
+            try:
+                if json.loads(bws.recv()).get("id") == 1:
+                    break
+            except websocket.WebSocketTimeoutException:
+                continue
+        bws.send(json.dumps({"id": 2, "method": "Target.setDiscoverTargets", "params": {"discover": True}}))
+        found = []
+        seen = set()
+
+        def handle(m):
+            meth = m.get("method", "")
+            if meth in ("Target.targetCreated", "Target.targetInfoChanged"):
+                ti = m["params"]["targetInfo"]
+                if ti["type"] in ("page", "iframe") and ti["targetId"] not in seen:
+                    seen.add(ti["targetId"])
+                    bws.send(json.dumps({"id": abs(hash(ti["targetId"])) % 99991,
+                        "method": "Target.attachToTarget",
+                        "params": {"targetId": ti["targetId"], "flatten": True}}))
+            if "result" in m and "sessionId" in m.get("result", {}):
+                bws.send(json.dumps({"id": 3, "method": "Network.enable",
+                                     "sessionId": m["result"]["sessionId"]}))
+            if meth == "Network.requestWillBeSent":
+                u = m["params"]["request"]["url"]
+                if "/proxy/api/" in u:
+                    found.append(u.split("/proxy/")[0] + "/proxy")
+
+        def pump():
+            while len(found) < 1:
+                try:
+                    handle(json.loads(bws.recv()))
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception:
+                    return
+        th = threading.Thread(target=pump, daemon=True)
+        th.start()
+        subprocess.run(["curl", "-s", "-X", "PUT",
+            f"http://localhost:{port}/json/new?https://www.kaggle.com/code"], capture_output=True)
+        # also open the notebook edit page — /k/ only appears with an active session
+        nbfile = os.path.join(CONFDIR, "notebook")
+        nb = note_arg or (open(nbfile).read().strip() if os.path.exists(nbfile) else "")
+        if not nb:
+            sys.exit("usage: kgl bootstrap <notebook-owner/slug>  (saved for next time)")
+        open(nbfile, "w").write(nb)
+        tabs = json.loads(subprocess.check_output(
+            ["curl", "-s", "--noproxy", "*", f"http://localhost:{port}/json/list"]))
+        page = next((t for t in tabs if t["type"] == "page" and "kaggle.com" in t["url"]), None)
+        if page:
+            pws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=20, suppress_origin=True)
+            pws.send(json.dumps({"id": 1, "method": "Page.navigate",
+                "params": {"url": f"https://www.kaggle.com/code/{nb}/edit"}}))
+        th.join(timeout=75)
+        if found:
+            open(BASEFILE, "w").write(found[0])
+            print("saved:", found[0][:80] + "…")
+        else:
+            sys.exit("bootstrap failed: cookies expired? re-login in 9222 chrome and retry")
+    finally:
+        proc.terminate()
 
 
 def pick_kernel_id():
@@ -161,7 +261,7 @@ def main():
         sys.exit(1)
     cmd = sys.argv[1]
     if cmd == "bootstrap":
-        return bootstrap()
+        return bootstrap(sys.argv[2] if len(sys.argv) > 2 else None)
     if cmd == "status":
         print(json.dumps(api("api/kernels"), indent=1))
         print("terminals:", json.dumps(api("api/terminals")))
