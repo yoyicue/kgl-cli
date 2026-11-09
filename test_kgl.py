@@ -687,19 +687,29 @@ def t_iso():
 t_iso()
 
 
-# --- cache kept on transient verify failure, dropped only on confirmed mismatch
+# --- cache on transient verify failure: refused (not blindly trusted), file kept
 def t_cache_fault_tolerance():
     orig_slug, orig_api = kgl._notebook_slug, kgl._kgl_cookie_api
     kgl._notebook_slug = lambda: "owner/target"
     cache = os.path.join(kgl.CONFDIR, "kernel_id")
+    real_sleep = kgl.time.sleep
+    kgl.time = types.SimpleNamespace(time=kgl.time.time,
+        strftime=kgl.time.strftime, sleep=lambda s: None)
     try:
         kgl._secure_write(cache, "owner/target 42\n")
-        kgl._kgl_cookie_api = lambda m, b: (False, None)  # transient API failure
-        check("transient failure -> cache kept, kid trusted",
-              kgl._notebook_kernel_id(required=False) == 42)
-        check("cache file still present", os.path.exists(cache))
+        kgl._kgl_cookie_api = lambda m, b: (False, None)  # persistent API failure
+        check("lazy: unknown ownership -> None (not trusted)",
+              kgl._notebook_kernel_id(required=False) is None)
+        try:
+            kgl._notebook_kernel_id(required=True)
+            check("required: unknown ownership -> refuses", False)
+        except SystemExit as e:
+            check("required: unknown ownership -> refuses", "verify" in str(e))
+        check("cache file still present (kept for recovery)", os.path.exists(cache))
     finally:
         kgl._notebook_slug, kgl._kgl_cookie_api = orig_slug, orig_api
+        kgl.time = types.SimpleNamespace(time=kgl.time.time,
+            strftime=kgl.time.strftime, sleep=real_sleep)
         if os.path.exists(cache):
             os.unlink(cache)
 
@@ -749,6 +759,50 @@ def t_fetch_json_argv():
 
 
 t_fetch_json_argv()
+
+
+# --- run-all kernel matching logic (unit: the matching loop body) -----------
+def t_runall_match_logic():
+    # extract the predicates the verification loop uses, as data checks:
+    def accept(kernels, sessions):
+        tgt = None
+        for sess in sessions:
+            if isinstance(sess, dict) and sess.get("path") == "__notebook_source__.ipynb":
+                tgt = sess.get("kernel", {}).get("id")
+        if tgt is None:
+            return False  # target unidentifiable -> unverified, never success
+        return any(k.get("id") == tgt and k.get("execution_state") == "busy"
+                   for k in kernels)
+
+    NB = [{"path": "__notebook_source__.ipynb", "kernel": {"id": "K1"}}]
+    check("target busy -> accept", accept([{"id": "K1", "execution_state": "busy"}], NB))
+    check("other kernel busy -> reject",
+          not accept([{"id": "K2", "execution_state": "busy"}], NB))
+    check("target idle -> reject",
+          not accept([{"id": "K1", "execution_state": "idle"}], NB))
+    check("no sessions -> reject (tgt unknown)",
+          not accept([{"id": "K1", "execution_state": "busy"}], []))
+    check("error dict instead of list -> reject (guarded upstream)",
+          not accept([{"id": "K1", "execution_state": "busy"}], {"error": 401}))
+
+
+t_runall_match_logic()
+
+
+# --- _fetch_json guards: error body parses but callers see the code ----------
+def t_fetch_json_error_body():
+    real_run = subprocess.run
+    def fake(cmd, **kw):
+        return types.SimpleNamespace(returncode=0, stdout=b'{"error": {"code": 401}}\n401')
+    subprocess.run = fake
+    try:
+        code, out = kgl._fetch_json("https://x/")
+        check("error body surfaces code", code == 401 and isinstance(out, dict))
+    finally:
+        subprocess.run = real_run
+
+
+t_fetch_json_error_body()
 
 
 # --- 7. import side effects land in the sandboxed HOME ---------------------

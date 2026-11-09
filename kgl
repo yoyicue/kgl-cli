@@ -630,30 +630,32 @@ def _headless_action(action, wait=30, timeout=240):
                             # one-off route: does NOT overwrite the global base
                             # file (user may be connected to another notebook)
                             route = _mint_route(str(run_id))
-                            _, kbody = _fetch_json(f"{route}/api/kernels")
-                            _, sbody = _fetch_json(f"{route}/api/sessions")
+                            kcode, kbody = _fetch_json(f"{route}/api/kernels")
+                            scode, sbody = _fetch_json(f"{route}/api/sessions")
+                            if kcode >= 400 or scode >= 400 or \
+                               not isinstance(kbody, list) or not isinstance(sbody, list):
+                                time.sleep(3)  # error/auth blip — keep polling
+                                continue
                             # target kernel = the notebook's own session kernel;
-                            # another kernel being busy proves nothing
+                            # unidentifiable target or another kernel's state
+                            # proves NOTHING about this run-all
                             tgt = None
-                            for sess in (sbody or []):
+                            for sess in sbody:
                                 if sess.get("path") == "__notebook_source__.ipynb":
                                     tgt = sess.get("kernel", {}).get("id")
-                            for k in (kbody or []):
-                                if tgt and k.get("id") != tgt:
-                                    continue  # not the notebook kernel — ignore
-                                if k.get("execution_state") == "busy":
+                            if tgt is None:
+                                time.sleep(3)  # notebook session not up yet
+                                continue
+                            for k in kbody:
+                                if k.get("id") == tgt and k.get("execution_state") == "busy":
                                     print(f"run-all executing (kernel {kid}, run {run_id})")
                                     return 0
-                                # fast cells: THIS kernel's own activity after
-                                # the click is evidence it executed
-                                la = _iso(k.get("last_activity", ""))
-                                if la > t_click:
-                                    print(f"run-all executed (kernel {kid}, run {run_id}; "
-                                          "back to idle — fast cells)")
-                                    return 0
+                                # ponytail: strict busy-only — last_activity can't
+                                # prove THIS click ran cells (other kernels' iopub
+                                # may touch timestamps); fast cells => honest rc 1
                         except SystemExit:
                             pass  # route mint flaky; keep polling
-                time.sleep(5)
+                time.sleep(3)
             print(f"execution not confirmed within {timeout}s "
                   "(no session, or kernel never went busy)", file=sys.stderr)
             return 1
@@ -786,10 +788,22 @@ def _notebook_kernel_id(required=True):
             if ok and url == f"/code/{slug}":
                 return kid
             if not ok:
-                # transient API failure: trust the cache rather than deleting
-                # it (deleting could strand a user with no running session)
+                # ownership UNKNOWN (API blip): retry once, then refuse to act
+                # on a possibly-stale cache rather than trusting it blind
+                time.sleep(3)
+                ok, k = _kgl_cookie_api("GetKernel", {"kernelId": kid})
+                url = ((k or {}).get("url") or "").rstrip("/")
+                if ok and url != f"/code/{slug}":
+                    os.unlink(cache)  # CONFIRMED foreign on retry
+                elif not ok:
+                    if required:
+                        sys.exit("cannot verify kernelId cache ownership (API "
+                                 "unavailable); retry when kaggle API recovers")
+                    return None  # lazy callers keep polling
+            if ok and url == f"/code/{slug}":
                 return kid
-            os.unlink(cache)  # CONFIRMED foreign — drop and re-resolve
+            if ok:
+                os.unlink(cache)  # CONFIRMED foreign — drop and re-resolve
     ok, d = _kgl_cookie_api("ListKernelSessions", {})
     if not ok or not isinstance(d, dict):
         if required:
