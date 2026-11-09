@@ -357,6 +357,55 @@ def t_watch_token_refresh():
 t_watch_token_refresh()
 
 
+# --- watch: error JSON / auth failure is NOT death; --once fails loudly -----
+def t_watch_error_paths():
+    orig_fb, orig_get = kgl._fb_session, kgl._fs_get
+    kgl._fb_session = lambda w=None: (111, "doc", "tok", None)
+
+    # 401 with error JSON body -> must NOT report death, --once -> rc 3
+    kgl._fs_get = lambda d, sub, i: (
+        {"error": {"code": 401, "message": "unauthenticated"}}, 401)
+    try:
+        rc = kgl.watch(None, 60, once=True)
+        check("401 error-json -> rc 3 (not death/2)", rc == 3, str(rc))
+    finally:
+        pass
+
+    # network failure (None, 0) -> rc 3
+    kgl._fs_get = lambda d, sub, i: (None, 0)
+    try:
+        rc = kgl.watch(None, 60, once=True)
+        check("network failure --once -> rc 3", rc == 3, str(rc))
+    finally:
+        pass
+
+    # integerValue status 4 (not doubleValue) -> recognized as RUNNING
+    kgl._fs_get = lambda d, sub, i: (
+        {"fields": {"status": {"integerValue": "4"}}}, 200) if sub == "Status" else (
+        {"fields": {}}, 200)
+    try:
+        rc = kgl.watch(None, 60, once=True)
+        check("integerValue status 4 -> healthy rc 0", rc == 0, str(rc))
+    finally:
+        kgl._fb_session, kgl._fs_get = orig_fb, orig_get
+
+
+t_watch_error_paths()
+
+
+# --- _fs_num: all Firestore Value variants -----------------------------------
+def t_fs_num():
+    check("doubleValue", kgl._fs_num({"doubleValue": 4.0}) == 4.0)
+    check("integerValue", kgl._fs_num({"integerValue": "4"}) == 4.0)
+    check("stringValue", kgl._fs_num({"stringValue": "42"}) == 42.0)
+    check("garbage stringValue -> default", kgl._fs_num({"stringValue": "x"}, -1) == -1)
+    check("missing -> default", kgl._fs_num({}, 7) == 7)
+    check("non-dict -> default", kgl._fs_num(None, 9) == 9)
+
+
+t_fs_num()
+
+
 # --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")
