@@ -857,6 +857,7 @@ def _headless_action(action, wait=30, timeout=240):
                                         cell_codes = _cells_of(nb0)
                                         if cell_codes:
                                             first_cell_code = _txt(cell_codes[0])
+                                    _start_sent_harvester()  # page frames first
                                     _attach_listener(route,
                                                      ent.get("kernel", {}).get("id"), jsess)
                                 if session_existed is False:
@@ -876,8 +877,7 @@ def _headless_action(action, wait=30, timeout=240):
                                 # cell that finished, even the first, does not pass.
                                 if (listener is not None and listener["events"]
                                         and first_cell_code is not None):
-                                    post = [c for ts, c in listener["events"]
-                                            if ts > t_click]
+                                    post = _post_events(listener, t_click)
                                     if post and post[0] == first_cell_code:
                                         second = (_txt(cell_codes[1])
                                                   if len(cell_codes or []) > 1
@@ -1016,6 +1016,13 @@ def _fetch_json(url):
         return int(code or 0), None
 
 
+def _post_events(box, t_click):
+    """Verdict-time filter: post-click events whose parent OUR page spoke
+    for (sent grows monotonically; checking here closes the CDP/iopub race)."""
+    return [code for ts, code, parent in box["events"]
+            if ts > t_click and parent in box["sent"]]
+
+
 def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None):
     """Subscribe to the target kernel's channels. Harvests every DISTINCT
     client id seen in parent_header (any message: the editor's connect-time
@@ -1052,11 +1059,12 @@ def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None
             mt = m.get("msg_type") or m.get("header", {}).get("msg_type")
             if mt != "execute_input":
                 continue
-            if parent not in box["sent"]:
-                continue  # not a client OUR page's iframe spoke for
-            if _txt((m.get("content") or {}).get("code")) in allow:
-                box["events"].append((time.time(),
-                                      _txt((m.get("content") or {}).get("code"))))
+            # record ALL cell-matching events (ts, code, parent); the sent
+            # check happens at VERDICT time — CDP frames may land after the
+            # iopub message, so record-time dropping would lose fast events
+            code = _txt((m.get("content") or {}).get("code"))
+            if code in allow:
+                box["events"].append((time.time(), code, parent))
     except Exception:
         box["ready"].set()  # failed; ok stays False
         return

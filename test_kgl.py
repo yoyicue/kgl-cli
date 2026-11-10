@@ -978,23 +978,23 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
         box["sent"].add("EDITOR")  # CDP harvester: our iframe spoke
         if exec_input == "queued-first-only":
             # a pre-queued FIRST cell alone (arrives after the click)
-            box["events"].append((time.time() + 3600, first_cell))
+            box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
         elif exec_input == "pre-noise":
             # pre-click noise (second cell), then a proper Run All after click
-            box["events"].append((time.time() - 3600, second_cell))
-            box["events"].append((time.time() + 3600, first_cell))
-            box["events"].append((time.time() + 3600, second_cell))
+            box["events"].append((time.time() - 3600, second_cell, "EDITOR"))
+            box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
+            box["events"].append((time.time() + 3600, second_cell, "EDITOR"))
         elif exec_input == "long-first":
             # first cell fires and keeps running (kernel busy, no second cell)
-            box["events"].append((time.time() + 3600, first_cell))
+            box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
         elif exec_input == "identical-one":
-            box["events"].append((time.time() + 3600, first_cell))
+            box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
         elif exec_input == "identical-two":
-            box["events"].append((time.time() + 3600, first_cell))
-            box["events"].append((time.time() + 3600, first_cell))
+            box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
+            box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
         elif exec_input:
-            box["events"].append((time.time() + 3600, first_cell))
-            box["events"].append((time.time() + 3600, second_cell))
+            box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
+            box["events"].append((time.time() + 3600, second_cell, "EDITOR"))
 
     kgl._iopub_listener = fake_listener
     kgl.time = types.SimpleNamespace(time=kgl.time.time,
@@ -1174,17 +1174,25 @@ def t_listener_attribution():
                               daemon=True)
         th.start()
         check("box ready + ok", box["ready"].wait(5) and box["ok"])
-        # the CDP harvester discovered our page's iframe spoke for "ED"
-        box["sent"].add("ED")
-        for _ in range(60):
-            if box["events"]:
+        for _ in range(80):  # deterministic: wait for BOTH matching events
+            if len(box["events"]) >= 2:
                 break
-            time.sleep(0.15)
+            time.sleep(0.1)
         box["stop"]["v"] = True
         check("editor client learned", "ED" in box["clients"])
-        check("only sent-from-our-page execute_input recorded",
-              len(box["events"]) == 1 and box["events"][0][1] == "print(1)",
-              f"events={box['events']} clients={box['clients']}")
+        check("all cell-matching events recorded regardless of parent",
+              len(box["events"]) == 2,  # OTHER's + ED's print(1); foreign code out
+              f"events={box['events']}")
+        # verdict-time filter: parent gate (sent discovered AFTER the events
+        # arrived — the race the design exists to close)
+        box["sent"].add("ED")
+        post = kgl._post_events(box, time.time() - 1)
+        check("verdict filter keeps our-page parent", post == ["print(1)"],
+              f"post={post}")
+        box["events"].append((time.time() + 3600, "print(1)", "OTHER"))
+        post2 = kgl._post_events(box, time.time() - 1)
+        check("verdict filter drops foreign parent", post2 == ["print(1)"],
+              f"post2={post2}")
     finally:
         wsmod.create_connection = real_conn
 
