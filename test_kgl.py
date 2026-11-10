@@ -867,12 +867,14 @@ t_cache_retry_mismatch()
 
 # --- FULL run-all path through _headless_action (mocked chrome + APIs) -------
 def _runall_scenario(name, *, pre_session=True, busy=False,
-                     exec_input=False, pre_unknown=False, want_rc=0, want_msg=""):
+                     exec_input=False, pre_unknown=False, first_run=False,
+                     want_rc=0, want_msg=""):
     """Drive the REAL _headless_action("run-all") with chrome fully faked."""
     import websocket as wsmod
     orig = {f: getattr(kgl, f) for f in
             ("_chrome_bin", "_cookie_store", "_notebook_slug", "_notebook_kernel_id",
-             "_target_sessions", "_mint_route", "_fetch_json", "_iopub_listener")}
+             "_target_sessions", "_mint_route", "_fetch_json", "_iopub_listener",
+             "_kgl_cookie_api")}
     real_sleep = kgl.time.sleep
 
     class FakeCDP:
@@ -895,19 +897,52 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
     kgl._cookie_store = lambda: [{"name": "XSRF-TOKEN", "value": "x",
                                   "domain": ".kaggle.com"}]
     kgl._notebook_slug = lambda: "owner/nb"
-    kgl._notebook_kernel_id = lambda required=True: 111
+    if first_run:
+        # production order is now deterministic: pre-click resolves kid ONCE
+        # (None, no session yet); loop-side calls mean a session may exist
+        st = {"kid": 0, "lst": 0}
+        def kid_fn(required=True):
+            st["kid"] += 1
+            return None if st["kid"] == 1 else 111
+        kgl._notebook_kernel_id = kid_fn
+        def api_first_run(m, b):
+            if m == "ListKernelSessions":
+                st["lst"] += 1
+                if st["lst"] == 1:
+                    # pre-click: OK and EMPTY -> target provably had no session
+                    return (True, {"sessions": []})
+                return (True, {"sessions": [{"kernelId": 111, "kernelRunId": 777}]})
+            return (True, {})
+        kgl._kgl_cookie_api = api_first_run
+    else:
+        kgl._notebook_kernel_id = lambda required=True: 111
     if pre_unknown:
-        # first call (pre-click) fails => unknown state; later calls succeed
+        # pre-click: BOTH the session list and target query fail => unknown;
+        # post-click they recover with a busy session
         calls = {"n": 0}
         def tgt(kid):
             calls["n"] += 1
             return (False, None) if calls["n"] == 1 else (True, {777})
         kgl._target_sessions = tgt
+        def api_pre_unknown(m, b):
+            if m == "ListKernelSessions":
+                calls["lst"] = calls.get("lst", 0) + 1
+                if calls["lst"] == 1:
+                    return (False, None)  # pre-click: query fails -> unknown
+                return (True, {"sessions": [{"kernelId": 111, "kernelRunId": 777}]})
+            return (True, {})
+        kgl._kgl_cookie_api = api_pre_unknown
     else:
         kgl._target_sessions = lambda kid: (True, {777})
     kgl._mint_route = lambda w=None: "https://route/proxy"
-    NB_LIVE = {"cells": [{"cell_type": "code", "source": "print(1)",
-                          "execution_count": 5}]}
+    def _txt(src):
+        return "".join(src) if isinstance(src, list) else str(src or "")
+
+    first_cell = "print(1)"
+    NB_LIVE = {"cells": [{"cell_type": "code", "source": first_cell,
+                          "execution_count": 5},
+                         {"cell_type": "code", "source": "print(2)",
+                          "execution_count": 6}]}
     def fake_fetch(url):
         if "api/sessions" in url:
             return 200, [{"path": "__notebook_source__.ipynb",
@@ -925,6 +960,7 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
         box["ready"].set()
         if exec_input:
             box["events"].append(time.time() + 3600)  # guaranteed > t_click
+            box["first_code"] = _txt(first_cell)      # Run All starts at cell 1
 
     kgl._iopub_listener = fake_listener
     kgl.time = types.SimpleNamespace(time=kgl.time.time,
@@ -1001,6 +1037,10 @@ def t_runall_full_paths():
     # 4. pre-click state UNKNOWN + busy later -> must NOT pass (reviewer case)
     _runall_scenario("unknown pre-state busy", busy=True, exec_input=False,
                      pre_unknown=True, want_rc=1)
+    # 5. FIRST RUN: no kid cache, pre-click session list EMPTY (provably fresh)
+    #    -> busy after click must verify (rc 0)
+    _runall_scenario("first-run fresh busy", busy=True, exec_input=False,
+                     first_run=True, want_rc=0, want_msg="fresh session busy")
 
 
 t_runall_full_paths()

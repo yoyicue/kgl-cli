@@ -578,7 +578,9 @@ def _headless_action(action, wait=30, timeout=240):
                     return m["result"]["result"].get("value")
             return "no-response"
 
-        kid = _notebook_kernel_id(required=action != "run-all")
+        # stop/save need the kid up front; run-all resolves lazily (a call
+        # here would also consume one resolution before the pre-click phase)
+        kid = None if action == "run-all" else _notebook_kernel_id(required=True)
 
         if action == "stop":
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
@@ -632,6 +634,11 @@ def _headless_action(action, wait=30, timeout=240):
                 return [c.get("source") for c in nb.get("cells", [])
                         if isinstance(c, dict) and c.get("cell_type") == "code"]
 
+            def _txt(src):
+                return "".join(src) if isinstance(src, list) else str(src or "")
+
+            first_cell_code = None  # Run All always starts at the FIRST code cell
+
             listener = None       # the only consulted subscription box
             warned = [False]
 
@@ -659,6 +666,12 @@ def _headless_action(action, wait=30, timeout=240):
                 return None
 
             try:
+                # point at provability, not at kid resolution: an OK response
+                # with ZERO sessions account-wide proves the target had none
+                # even when we can't resolve its kernelId yet (first run)
+                okL, dL = _kgl_cookie_api("ListKernelSessions", {})
+                if okL and isinstance(dL, dict) and not dL.get("sessions"):
+                    session_existed = False
                 kid0 = _notebook_kernel_id(required=False)
                 if kid0 is not None:
                     ok0, runs0 = _target_sessions(kid0)
@@ -683,8 +696,9 @@ def _headless_action(action, wait=30, timeout=240):
                                     f"{route0}/api/contents/__notebook_source__.ipynb?content=1")
                                 nb0 = (cb0 or {}).get("content") if isinstance(cb0, dict) else None
                                 if isinstance(nb0, dict):
-                                    pre_counts = _nb_max_exec(nb0)
                                     cell_codes = _cells_of(nb0)
+                                    if cell_codes:
+                                        first_cell_code = _txt(cell_codes[0])
                                 if ent:
                                     _attach_listener(route0,
                                                      ent.get("kernel", {}).get("id"), jsess)
@@ -703,11 +717,15 @@ def _headless_action(action, wait=30, timeout=240):
                 late_note = False
                 t0 = t_click
                 while time.time() - t0 < timeout:
-                    if listener is not None and \
-                       any(e > t_click for e in listener["events"]):
-                        print("run-all executing (execute_input from the editor "
-                              "for this notebook's cells)")
-                        return 0
+                    if listener is not None and listener["events"]:
+                        evs = [e for e in listener["events"] if e > t_click]
+                        # Run All executes from the FIRST code cell; an event
+                        # stream starting elsewhere is a queued/foreign request
+                        if evs and (first_cell_code is None or
+                                    listener.get("first_code") == first_cell_code):
+                            print("run-all executing (attributed execute_input "
+                                  "starting at the first cell)")
+                            return 0
                     kid = _notebook_kernel_id(required=False)
                     if kid is not None:
                         ok, runs = _target_sessions(kid)
@@ -740,6 +758,8 @@ def _headless_action(action, wait=30, timeout=240):
                                             f"{route}/api/contents/__notebook_source__.ipynb?content=1")
                                         nb0 = (cb0 or {}).get("content") if isinstance(cb0, dict) else None
                                         cell_codes = _cells_of(nb0)
+                                        if cell_codes:
+                                            first_cell_code = _txt(cell_codes[0])
                                     _attach_listener(route,
                                                      ent.get("kernel", {}).get("id"), jsess)
                                 if session_existed is False:
@@ -905,8 +925,11 @@ def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None
             parent = m.get("parent_header") or {}
             if parent.get("session") != jupyter_session:
                 continue  # another client's request
-            if _txt((m.get("content") or {}).get("code")) in allow:
+            code = _txt((m.get("content") or {}).get("code"))
+            if code in allow:
                 box["events"].append(time.time())
+                if "first_code" not in box:
+                    box["first_code"] = code  # Run All starts at the first cell
     except Exception:
         box["ready"].set()  # failed to connect; ok stays False
         return
