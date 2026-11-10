@@ -880,7 +880,12 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
 
     def fake_harvester(port, sent_ids, sent_reqs, stop, ready, ok):
         if sub_fail:
-            ready.set()  # attempt done; ok stays False
+            ready.set()  # attempt done; ok stays False (pre-click failure)
+            if exec_input == "recover":  # harvester recovers POST-click and
+                # still observes frames — must NOT upgrade the verdict (spec)
+                sent_ids.add("EDITOR")
+                sent_reqs.append((time.time() + 3600, first_cell))
+                sent_reqs.append((time.time() + 3600, second_cell))
             return
         ok[0] = True  # subscription confirmed
         ready.set()
@@ -1114,6 +1119,10 @@ def t_runall_full_paths():
     # 10. EMPTY second code cell doesn't make a 3-cell notebook "1-cell"
     _runall_scenario("empty middle cell", exec_input="queued-first-only",
                      empty_second=True, want_rc=1)
+    # 10y. subscription failed pre-click, recovered after: observed requests
+    #      must NOT yield submitted (spec: pre-click unconfirmed => rc 1)
+    _runall_scenario("sub fail, post-click recovery", exec_input="recover",
+                     sub_fail=True, want_rc=1)
     # 10z. subscription NEVER confirms + fresh-session busy -> rc 1 (spec:
     #      unconfirmed subscription can never yield confirmation verdicts)
     _runall_scenario("sub fail + fresh busy", busy=True, exec_input=False,

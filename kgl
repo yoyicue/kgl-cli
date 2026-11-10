@@ -911,14 +911,17 @@ def _headless_action(action, wait=30, timeout=240):
                                 pass  # route mint flaky; keep polling
                     time.sleep(3)
                 reqs = [c for ts, c in sent_reqs if ts > t_click]
-                if first_cell_code is not None and reqs \
-                   and reqs[0] == first_cell_code:
+                if (harvester_confirmed
+                        and first_cell_code is not None and reqs
+                        and reqs[0] == first_cell_code):
                     second = (_txt(cell_codes[1])
                               if len(cell_codes or []) > 1
                               and cell_codes[1] else None)
                     if second is None or second in reqs[1:]:
                         # window expired with no KERNEL evidence: our page did
-                        # submit Run-All-shaped requests (spec: submitted)
+                        # submit Run-All-shaped requests (spec: submitted —
+                        # and only with a subscription confirmed BEFORE the
+                        # click; a post-click recovery cannot upgrade rc)
                         print("run-all submitted (our page issued Run-All-"
                               "shaped requests; execution unconfirmed — no "
                               "kernel evidence within the window)")
