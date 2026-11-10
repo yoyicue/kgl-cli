@@ -41,7 +41,10 @@ kgl put local remote                # upload (auto-mkdir parents)
   common paths auto-detected) and `echo owner/slug > ~/.config/kgl/notebook`.
   These actions drive the Kaggle editor in an isolated headless chrome
   (ephemeral profile, auto-allocated CDP port) and verify the outcome
-  server-side before exiting (exit 0 = verified).
+  server-side before exiting. `run-all` exit 0 means execution was observed
+  with attribution (client + notebook + Run-All-shaped sequence); a Run All
+  queued in the same editor BEFORE the click is externally indistinguishable
+  and remains a documented limit — treat 0 as 'verified within these limits'.
 - Cookie refresh: re-login to kaggle in any chrome with `--remote-debugging-port=9222`;
   `kgl bootstrap` picks them up and caches (verified against the API first).
 - `kgl term` is unsupported: Kaggle blocks the terminado websocket. Use `sh`/`exec`.

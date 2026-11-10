@@ -967,6 +967,9 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
             box["events"].append((time.time() - 3600, second_cell))
             box["events"].append((time.time() + 3600, first_cell))
             box["events"].append((time.time() + 3600, second_cell))
+        elif exec_input == "long-first":
+            # first cell fires and keeps running (kernel busy, no second cell)
+            box["events"].append((time.time() + 3600, first_cell))
         elif exec_input:
             box["events"].append((time.time() + 3600, first_cell))
             box["events"].append((time.time() + 3600, second_cell))
@@ -1040,7 +1043,7 @@ def t_runall_full_paths():
                      want_rc=1)
     # 2. execute_input observed -> pass
     _runall_scenario("exec_input", exec_input=True,
-                     want_rc=0, want_msg="execute_input")
+                     want_rc=0, want_msg="Run-All-shaped")
     # 3. idle everywhere, no evidence -> fail honestly
     _runall_scenario("no evidence", busy=False, exec_input=False, want_rc=1)
     # 4. pre-click state UNKNOWN + busy later -> must NOT pass (reviewer case)
@@ -1056,6 +1059,10 @@ def t_runall_full_paths():
     # 7. pre-click noise must not pollute; proper post-click Run All passes
     _runall_scenario("pre-click noise", exec_input="pre-noise",
                      want_rc=0, want_msg="Run-All-shaped")
+    # 8. LONG first cell: attributed first-cell event + kernel busy -> verified
+    #    (must not wait out the timeout while the first cell trains)
+    _runall_scenario("long first cell", exec_input="long-first", busy=True,
+                     want_rc=0, want_msg="still running")
 
 
 t_runall_full_paths()

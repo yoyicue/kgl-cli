@@ -717,21 +717,6 @@ def _headless_action(action, wait=30, timeout=240):
                 late_note = False
                 t0 = t_click
                 while time.time() - t0 < timeout:
-                    if listener is not None and listener["events"]:
-                        post = [c for ts, c in listener["events"] if ts > t_click]
-                        # Run All executes cells IN ORDER from the first; a
-                        # post-click stream that starts at the first cell AND
-                        # (for multi-cell notebooks) reaches the second cell
-                        # is Run-All-shaped. A single queued cell — even the
-                        # first — does not pass. (1-cell notebooks and a
-                        # fully pre-queued Run All remain accepted limits.)
-                        seq_ok = bool(post) and post[0] == first_cell_code and (
-                            len(cell_codes or []) < 2
-                            or (cell_codes[1] and _txt(cell_codes[1]) in post))
-                        if first_cell_code is not None and seq_ok:
-                            print("run-all executing (attributed Run-All-shaped "
-                                  "execute_input sequence)")
-                            return 0
                     kid = _notebook_kernel_id(required=False)
                     if kid is not None:
                         ok, runs = _target_sessions(kid)
@@ -774,6 +759,36 @@ def _headless_action(action, wait=30, timeout=240):
                                         if (k.get("id") == ent.get("kernel", {}).get("id")
                                                 and k.get("execution_state") == "busy"):
                                             print("run-all executing (fresh session busy)")
+                                            return 0
+                                # Run-All shape verdict (ent + kbody at hand):
+                                # post-click stream STARTS at the first code cell,
+                                # then either reaches the SECOND cell as a
+                                # DISTINCT event (post[1:] — identical-code cells
+                                # need two events) or the first cell is still
+                                # running (kernel busy; a long first cell must
+                                # not time out mid-execution). A single queued
+                                # cell that finished, even the first, does not pass.
+                                if (listener is not None and listener["events"]
+                                        and first_cell_code is not None):
+                                    post = [c for ts, c in listener["events"]
+                                            if ts > t_click]
+                                    if post and post[0] == first_cell_code:
+                                        second = (_txt(cell_codes[1])
+                                                  if len(cell_codes or []) > 1
+                                                  and cell_codes[1] else None)
+                                        if second is None:
+                                            print("run-all executing (attributed "
+                                                  "first-cell run; 1-cell notebook)")
+                                            return 0
+                                        if second in post[1:]:
+                                            print("run-all executing (attributed "
+                                                  "Run-All-shaped sequence)")
+                                            return 0
+                                        if any(k.get("id") == ent.get("kernel", {}).get("id")
+                                               and k.get("execution_state") == "busy"
+                                               for k in kbody):
+                                            print("run-all executing (attributed "
+                                                  "first cell still running)")
                                             return 0
                             except SystemExit:
                                 pass  # route mint flaky; keep polling
