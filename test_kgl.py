@@ -874,7 +874,18 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
     orig = {f: getattr(kgl, f) for f in
             ("_chrome_bin", "_cookie_store", "_notebook_slug", "_notebook_kernel_id",
              "_target_sessions", "_mint_route", "_fetch_json", "_iopub_listener",
-             "_kgl_cookie_api")}
+             "_kgl_cookie_api", "_cdp_sent_harvester")}
+    fake_sent_ids, fake_sent_reqs = set(), []
+
+    def fake_harvester(port, sent_ids, sent_reqs, stop, ready, ok):
+        ok[0] = True  # subscription confirmed
+        ready.set()
+        sent_ids.update(fake_sent_ids)
+        if exec_input in ("sent-only", "pre-noise", "sent+exec"):
+            fake_sent_reqs.append((time.time() + 3600, first_cell))
+            fake_sent_reqs.append((time.time() + 3600, second_cell))
+        sent_reqs.extend(fake_sent_reqs)
+    kgl._cdp_sent_harvester = fake_harvester
     real_sleep = kgl.time.sleep
 
     class FakeCDP:
@@ -992,6 +1003,10 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
         elif exec_input == "identical-two":
             box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
             box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
+        elif exec_input == "sent-only":
+            # page issued the requests (CDP sent frames) but NO kernel-side
+            # evidence: must report SUBMITTED, never 'executing'
+            pass
         elif exec_input:
             box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
             box["events"].append((time.time() + 3600, second_cell, "EDITOR"))
@@ -1064,7 +1079,10 @@ def t_runall_full_paths():
     _runall_scenario("pre-busy no evidence", busy=True, exec_input=False,
                      want_rc=1)
     # 2. execute_input observed -> pass
-    _runall_scenario("exec_input", exec_input=True,
+    _runall_scenario("sent+exec -> submitted first", exec_input="sent+exec",
+                     want_rc=0, want_msg="submitted")
+    # iopub-only path: no sent-reqs (harvester saw none), kernel evidence only
+    _runall_scenario("iopub only", exec_input=True,
                      want_rc=0, want_msg="Run-All-shaped")
     # 3. idle everywhere, no evidence -> fail honestly
     _runall_scenario("no evidence", busy=False, exec_input=False, want_rc=1)
@@ -1092,6 +1110,9 @@ def t_runall_full_paths():
     # 10. EMPTY second code cell doesn't make a 3-cell notebook "1-cell"
     _runall_scenario("empty middle cell", exec_input="queued-first-only",
                      empty_second=True, want_rc=1)
+    # 10b. sent-requests alone => submitted (not 'executing'), rc 0
+    _runall_scenario("sent only -> submitted", exec_input="sent-only",
+                     want_rc=0, want_msg="submitted")
     # 11. IDENTICAL first/second cell code: one event must NOT verify;
     #     two events must (regression for the distinct-event requirement)
     _runall_scenario("identical cells, single event", exec_input="identical-one",
@@ -1270,11 +1291,29 @@ def t_listener_ready_semantics():
 t_listener_ready_semantics()
 
 
-# --- 7. import side effects# --- _cdp_sent_harvester: ack-gated ready, dual harvest, restart flag --------
+# --- _cdp_sent_harvester: ack-gated ok, dual harvest, failure semantics ------
 def t_cdp_harvester():
     import threading, websocket as wsmod
+    tabs_payload = json.dumps([{"type": "iframe",
+                                "url": "https://kkb.jupyter-proxy/x",
+                                "webSocketDebuggerUrl": "ws://f"}])
+    real_co = subprocess.check_output
+    subprocess.check_output = lambda *a, **k: tabs_payload.encode()
+    real_conn = wsmod.create_connection
+
+    def run_with(recv_fn):
+        sent_ids, sent_reqs = set(), []
+        stop, ready, ok = {"v": False}, threading.Event(), [False]
+        wsmod.create_connection = recv_fn
+        th = threading.Thread(target=kgl._cdp_sent_harvester,
+                              args=("1", sent_ids, sent_reqs, stop, ready, ok),
+                              daemon=True)
+        th.start()
+        return sent_ids, sent_reqs, stop, ready, ok
+
+    # success path: ack + frames
     frames = iter([
-        json.dumps({"id": 1, "result": {}}),  # Network.enable ack
+        json.dumps({"id": 1, "result": {}}),
         json.dumps({"method": "Network.webSocketFrameSent",
                     "params": {"response": {"payloadData": json.dumps({
                         "header": {"session": "ED", "msg_type": "kernel_info_request"},
@@ -1288,63 +1327,57 @@ def t_cdp_harvester():
                         "header": {"session": "ED", "msg_type": "execute_request"},
                         "content": {"code": ["print(2)", "\n"]}})}}}),
     ])
-    state = {"n": 0}
     class HW:
         def send(self, d): pass
         def settimeout(self, t): pass
         def recv(self):
-            state["n"] += 1
             try:
                 return next(frames)
             except StopIteration:
                 raise wsmod.WebSocketTimeoutException()
         def close(self): pass
-    real_conn = wsmod.create_connection
-    tabs_payload = json.dumps([{"type": "iframe",
-                                "url": "https://kkb.jupyter-proxy/x",
-                                "webSocketDebuggerUrl": "ws://f"}])
-    real_co = subprocess.check_output
-    subprocess.check_output = lambda *a, **k: tabs_payload.encode()
-    wsmod.create_connection = lambda *a, **k: HW()
     try:
-        sent_ids, sent_reqs = set(), []
-        stop, ready = {"v": False}, threading.Event()
-        th = threading.Thread(target=kgl._cdp_sent_harvester,
-                              args=("1", sent_ids, sent_reqs, stop, ready),
-                              daemon=True)
-        th.start()
-        check("ready set (enable acked)", ready.wait(5))
+        ids, reqs, stop, ready, ok = run_with(lambda *a, **k: HW())
+        check("ready set on ack", ready.wait(5))
+        check("ok TRUE only after ack", ok[0] is True)
         for _ in range(60):
-            if len(sent_reqs) >= 2:
+            if len(reqs) >= 2:
                 break
             time.sleep(0.1)
         stop["v"] = True
-        check("client id harvested", sent_ids == {"ED"})
+        check("client id harvested", ids == {"ED"})
         check("execute_requests harvested incl list-form code",
-              [c for _, c in sent_reqs] == ["print(1)", "print(2)\n"],
-              str(sent_reqs))
+              [c for _, c in reqs] == ["print(1)", "print(2)\n"], str(reqs))
+
+        # FAIL: no ack arrives (timeout) -> ready set, ok False
+        class NoAck:
+            def send(self, d): pass
+            def settimeout(self, t): pass
+            def recv(self):
+                raise wsmod.WebSocketTimeoutException()
+            def close(self): pass
+        ids2, reqs2, stop2, ready2, ok2 = run_with(lambda *a, **k: NoAck())
+        check("no-ack: ready set, ok FALSE", ready2.wait(6) and ok2[0] is False)
+
+        # FAIL: connect error -> ready set, ok False
+        class Drop:
+            def __init__(self, *a, **k): raise OSError("cdp gone")
+        ids3, reqs3, stop3, ready3, ok3 = run_with(lambda *a, **k: Drop())
+        check("connect fail: ready set, ok FALSE", ready3.wait(6) and ok3[0] is False)
+
+        # FAIL: no iframe target -> ready set, ok False
+        subprocess.check_output = lambda *a, **k: json.dumps([]).encode()
+        ids4, reqs4, stop4, ready4, ok4 = run_with(lambda *a, **k: HW())
+        check("no iframe: ready set, ok FALSE", ready4.wait(6) and ok4[0] is False)
     finally:
         wsmod.create_connection = real_conn
         subprocess.check_output = real_co
-
-    # drop mid-stream: thread exits, caller restart is an allowed new one
-    class Drop:
-        def __init__(self, *a, **k): pass
-        def send(self, d): raise OSError("cdp gone")
-    wsmod.create_connection = lambda *a, **k: Drop()
-    try:
-        sent_ids2, sent_reqs2 = set(), []
-        stop2, ready2 = {"v": False}, threading.Event()
-        kgl._cdp_sent_harvester("1", sent_ids2, sent_reqs2, stop2, ready2)
-        check("connect failure -> ready still set", ready2.is_set())
-    finally:
-        wsmod.create_connection = real_conn
 
 
 t_cdp_harvester()
 
 
-# --- 7. import side effects land in the sandboxed HOME ---------------------
+# --- 7. import side effects land in the sandboxed HOME ---------------------# --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")
     check("config created under fake HOME", os.path.isdir(cfg))

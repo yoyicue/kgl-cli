@@ -588,26 +588,29 @@ def _headless_action(action, wait=30, timeout=240):
         sent_ids = set()        # client ids our page spoke for
         sent_reqs = []          # (ts, code) execute_requests our page issued
         harvester_ready = threading.Event()
+        harvester_ok = [False]
         harvester_on = [False]
 
         def _start_sent_harvester(wait_ready=True):
-            """(Re)start the CDP harvester; waits for the Network.enable ack
-            before returning so the click never races the subscription."""
+            """(Re)start the CDP harvester. Returns True ONLY when the
+            subscription was confirmed; ready-without-ok is a failed attempt
+            (no iframe / no ACK / connect error) and callers must not treat
+            it as subscribed."""
             if harvester_on[0]:
-                return True
+                return harvester_ok[0]
             harvester_on[0] = True
             harvester_ready.clear()
 
             def run():
                 try:
                     _cdp_sent_harvester(port, sent_ids, sent_reqs,
-                                        sent_stop, harvester_ready)
+                                        sent_stop, harvester_ready, harvester_ok)
                 finally:
                     harvester_on[0] = False  # exited: restart is allowed
             threading.Thread(target=run, daemon=True).start()
             if wait_ready:
-                return harvester_ready.wait(8)
-            return True
+                harvester_ready.wait(8)
+            return harvester_ok[0]
 
         def _iframe_ready():
             """Editor's jupyter iframe target exists again after a reload."""
@@ -802,6 +805,9 @@ def _headless_action(action, wait=30, timeout=240):
                 if _start_sent_harvester(wait_ready=True):
                     break
                 time.sleep(3)
+            # if still not ok, attribution evidence is unavailable: the run
+            # can at most report 'submitted'; execution confirmation is off
+            harvester_confirmed = harvester_ok[0]
             t_click = time.time()
             t_click = time.time()
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
@@ -872,8 +878,9 @@ def _headless_action(action, wait=30, timeout=240):
                                               if len(cell_codes or []) > 1
                                               and cell_codes[1] else None)
                                     if second is None or second in reqs[1:]:
-                                        print("run-all executing (our page issued "
-                                              "Run-All-shaped requests)")
+                                        print("run-all submitted (our page issued "
+                                              "Run-All-shaped requests; execution "
+                                              "unconfirmed — no kernel evidence)")
                                         return 0
                                 # Run-All shape verdict (ent + kbody at hand):
                                 # post-click stream STARTS at the first code cell,
@@ -1024,14 +1031,14 @@ def _fetch_json(url):
         return int(code or 0), None
 
 
-def _cdp_sent_harvester(port, sent_ids, sent_reqs, stop, ready):
+def _cdp_sent_harvester(port, sent_ids, sent_reqs, stop, ready, ok):
     """Attach CDP Network to the editor's jupyter iframe. Harvests:
     - every header.session our page SPOKE FOR -> sent_ids (attribution)
     - every execute_request our page ISSUED -> sent_reqs (ts, code): the
-      requests themselves are causal evidence, immune to kernel-listener
-      timing (fast cells covered even before the listener attaches).
-    `ready` is set once Network.enable is ACKED (callers wait before the
-      click); set-but-failed on error. Safe to restart after a drop."""
+      requests themselves prove SUBMISSION (not execution), immune to
+      kernel-listener timing.
+    `ready` = attempt finished; `ok`[0] = True ONLY when Network.enable was
+    ACKED. Callers gate the click on ok, never on ready alone."""
     import websocket
     try:
         tabs = json.loads(subprocess.check_output(
@@ -1040,24 +1047,27 @@ def _cdp_sent_harvester(port, sent_ids, sent_reqs, stop, ready):
         fr = next((t for t in tabs if t.get("type") == "iframe"
                    and "jupyter-proxy" in t.get("url", "")), None)
         if not fr:
-            ready.set()  # no iframe yet; caller may retry later
+            ready.set()  # attempt done; ok stays False (caller retries)
             return
         hws = websocket.create_connection(fr["webSocketDebuggerUrl"],
                                           timeout=120, suppress_origin=True)
         hws.send(json.dumps({"id": 1, "method": "Network.enable"}))
-        # wait for the enable ack before declaring readiness
         hws.settimeout(5)
+        acked = False
         t0 = time.time()
         while time.time() - t0 < 5:
             try:
                 m = json.loads(hws.recv())
                 if m.get("id") == 1:
+                    acked = True
                     break
             except websocket.WebSocketTimeoutException:
                 break
             except Exception:
                 ready.set()
                 return
+        if acked:
+            ok[0] = True  # subscription CONFIRMED — the only ok path
         ready.set()
         hws.settimeout(10)
         while not stop["v"]:
@@ -1081,7 +1091,7 @@ def _cdp_sent_harvester(port, sent_ids, sent_reqs, stop, ready):
             except Exception:
                 pass
     except Exception:
-        ready.set()  # failed to connect; ok stays implied-false
+        ready.set()  # attempt done; ok stays False
         return
 
 
