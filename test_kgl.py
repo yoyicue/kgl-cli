@@ -1270,7 +1270,81 @@ def t_listener_ready_semantics():
 t_listener_ready_semantics()
 
 
-# --- 7. import side effects# --- 7. import side effects land in the sandboxed HOME ---------------------
+# --- 7. import side effects# --- _cdp_sent_harvester: ack-gated ready, dual harvest, restart flag --------
+def t_cdp_harvester():
+    import threading, websocket as wsmod
+    frames = iter([
+        json.dumps({"id": 1, "result": {}}),  # Network.enable ack
+        json.dumps({"method": "Network.webSocketFrameSent",
+                    "params": {"response": {"payloadData": json.dumps({
+                        "header": {"session": "ED", "msg_type": "kernel_info_request"},
+                        "content": {}})}}}),
+        json.dumps({"method": "Network.webSocketFrameSent",
+                    "params": {"response": {"payloadData": json.dumps({
+                        "header": {"session": "ED", "msg_type": "execute_request"},
+                        "content": {"code": "print(1)"}})}}}),
+        json.dumps({"method": "Network.webSocketFrameSent",
+                    "params": {"response": {"payloadData": json.dumps({
+                        "header": {"session": "ED", "msg_type": "execute_request"},
+                        "content": {"code": ["print(2)", "\n"]}})}}}),
+    ])
+    state = {"n": 0}
+    class HW:
+        def send(self, d): pass
+        def settimeout(self, t): pass
+        def recv(self):
+            state["n"] += 1
+            try:
+                return next(frames)
+            except StopIteration:
+                raise wsmod.WebSocketTimeoutException()
+        def close(self): pass
+    real_conn = wsmod.create_connection
+    tabs_payload = json.dumps([{"type": "iframe",
+                                "url": "https://kkb.jupyter-proxy/x",
+                                "webSocketDebuggerUrl": "ws://f"}])
+    real_co = subprocess.check_output
+    subprocess.check_output = lambda *a, **k: tabs_payload.encode()
+    wsmod.create_connection = lambda *a, **k: HW()
+    try:
+        sent_ids, sent_reqs = set(), []
+        stop, ready = {"v": False}, threading.Event()
+        th = threading.Thread(target=kgl._cdp_sent_harvester,
+                              args=("1", sent_ids, sent_reqs, stop, ready),
+                              daemon=True)
+        th.start()
+        check("ready set (enable acked)", ready.wait(5))
+        for _ in range(60):
+            if len(sent_reqs) >= 2:
+                break
+            time.sleep(0.1)
+        stop["v"] = True
+        check("client id harvested", sent_ids == {"ED"})
+        check("execute_requests harvested incl list-form code",
+              [c for _, c in sent_reqs] == ["print(1)", "print(2)\n"],
+              str(sent_reqs))
+    finally:
+        wsmod.create_connection = real_conn
+        subprocess.check_output = real_co
+
+    # drop mid-stream: thread exits, caller restart is an allowed new one
+    class Drop:
+        def __init__(self, *a, **k): pass
+        def send(self, d): raise OSError("cdp gone")
+    wsmod.create_connection = lambda *a, **k: Drop()
+    try:
+        sent_ids2, sent_reqs2 = set(), []
+        stop2, ready2 = {"v": False}, threading.Event()
+        kgl._cdp_sent_harvester("1", sent_ids2, sent_reqs2, stop2, ready2)
+        check("connect failure -> ready still set", ready2.is_set())
+    finally:
+        wsmod.create_connection = real_conn
+
+
+t_cdp_harvester()
+
+
+# --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")
     check("config created under fake HOME", os.path.isdir(cfg))
