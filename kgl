@@ -243,7 +243,7 @@ FB_KEY = "AIzaSyD83TRC5oxzFh-vaPb_4X2tHBigTcgkD0Y"  # kkb-production web key
 FS_BASE = "https://firestore.googleapis.com/v1/projects/kkb-production/databases/(default)/documents"
 
 
-def _fb_session(which=None):
+def _fb_session(which=None, quiet=False):
     """Run the firebase auth chain once. Returns (run_id, doc, idt, kgl_api)."""
     cookies = _cookie_store()
     CK = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
@@ -263,7 +263,8 @@ def _fb_session(which=None):
 
     sessions = kgl_api("ListKernelSessions").get("sessions", [])
     run = _select_session(sessions, which)
-    print(f"session: {run['title']} (kernelRunId {run['kernelRunId']})")
+    if not quiet:
+        print(f"session: {run['title']} (kernelRunId {run['kernelRunId']})")
 
     tok = kgl_api("GetFirebaseAuthToken")["authToken"]
     code, out = _post_json(
@@ -317,10 +318,10 @@ def _fs_get(doc, sub, idt):
         return None, int(code or 0)
 
 
-def _mint_route(which=None):
+def _mint_route(which=None, quiet=False):
     """Run the mint chain and return the /k/ route URL WITHOUT touching the
     global base file (callers may want a one-off connection context)."""
-    _run_id, doc, idt, _api = _fb_session(which)
+    _run_id, doc, idt, _api = _fb_session(which, quiet=quiet)
     url_doc, code = _fs_get(doc, "JupyterURL", idt)
     try:
         return url_doc["fields"]["url"]["stringValue"].rstrip("/")
@@ -724,7 +725,7 @@ def _headless_action(action, wait=30, timeout=240):
                             run_id = min(runs)  # kernelRUNid — mint matches on this
                             try:
                                 # one-off route: never overwrites the global base
-                                route = _mint_route(str(run_id))
+                                route = _mint_route(str(run_id), quiet=True)
                                 kcode, kbody = _fetch_json(f"{route}/api/kernels")
                                 scode, sbody = _fetch_json(f"{route}/api/sessions")
                                 if (kcode >= 400 or scode >= 400

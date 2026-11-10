@@ -292,7 +292,7 @@ def t_watch_alert():
     run_id, doc, idt = 111, "doc", "tok"
     # fake _fb_session and _fs_get: first Status has status 5 (dead)
     orig_fb, orig_get = kgl._fb_session, kgl._fs_get
-    kgl._fb_session = lambda w=None: (run_id, doc, idt, None)
+    kgl._fb_session = lambda w=None, quiet=False: (run_id, doc, idt, None)
     def fake_get(d, sub, i):
         if sub == "Status":
             return {"fields": {"status": {"doubleValue": 5},
@@ -307,7 +307,7 @@ def t_watch_alert():
         kgl._fb_session, kgl._fs_get = orig_fb, orig_get
 
     # healthy: status 4, gpu busy then zero -> note printed, rc 0
-    kgl._fb_session = lambda w=None: (run_id, doc, idt, None)
+    kgl._fb_session = lambda w=None, quiet=False: (run_id, doc, idt, None)
     states = iter([
         ({"fields": {"status": {"doubleValue": 4}}}, 200),
     ])
@@ -722,7 +722,7 @@ def t_mint_route_no_side_effect():
     basefile = kgl.BASEFILE
     kgl._secure_write(basefile, "https://original-route/proxy\n")
     orig = kgl._fb_session
-    kgl._fb_session = lambda w=None: (1, "doc", "tok", None)
+    kgl._fb_session = lambda w=None, quiet=False: (1, "doc", "tok", None)
     orig_get = kgl._fs_get
     kgl._fs_get = lambda d, sub, i: (
         {"fields": {"url": {"stringValue": "https://minted-route/proxy"}}}, 200)
@@ -934,7 +934,7 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
         kgl._kgl_cookie_api = api_pre_unknown
     else:
         kgl._target_sessions = lambda kid: (True, {777})
-    kgl._mint_route = lambda w=None: "https://route/proxy"
+    kgl._mint_route = lambda w=None, quiet=False: "https://route/proxy"
     def _txt(src):
         return "".join(src) if isinstance(src, list) else str(src or "")
 
