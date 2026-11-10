@@ -611,22 +611,25 @@ def _headless_action(action, wait=30, timeout=240):
             return 1
         if action == "run-all":
             # Causal proof of execution, strongest first:
-            #   1. execute_input on the target kernel's iopub whose code matches
-            #      one of THIS notebook's cells, arriving after the click.
-            #      (residual: another client running the same notebook, or a
-            #      Run All queued before our click — accepted, documented)
+            #   1. execute_input on the target kernel FROM THE WEB EDITOR'S
+            #      jupyter session (header.session match) whose code matches
+            #      one of this notebook's cells, arriving after the click.
+            #      Residual: a Run All queued before our click in the same
+            #      editor — externally indistinguishable, documented.
             #   2. live-notebook execution_count vs a PRE-CLICK LIVE snapshot
             #      (never the draft: it can lag live state or hold stale
             #      counters from a previous kernel)
-            #   3. busy on the target kernel — valid ONLY when the session was
-            #      CREATED by this click (fresh kernel starts idle); busy on a
-            #      pre-existing session may predate the click
+            #   3. busy on the target kernel — ONLY when the session provably
+            #      did not exist before the click (fresh kernel starts idle).
+            #      Unknown pre-click state => busy proves nothing.
             import threading
             events, stop = [], {"v": False}
             listener = None
-            pre_counts = None       # live-notebook snapshot (same source as post)
-            session_existed = False
-            cell_codes = None       # code-membership allowlist for association
+            pre_counts = None
+            cell_codes = None
+            jsess = None           # web editor's jupyter session id
+            # None = unknown (pre-click query failed), True/False = known
+            session_existed = None
 
             def _cells_of(nb):
                 if not isinstance(nb, dict):
@@ -634,38 +637,44 @@ def _headless_action(action, wait=30, timeout=240):
                 return [c.get("source") for c in nb.get("cells", [])
                         if isinstance(c, dict) and c.get("cell_type") == "code"]
 
-            def _attach_listener(route, tgt):
+            def _attach_listener(route, tgt, js):
                 nonlocal listener
                 if listener is None:
+                    rdy = threading.Event()
                     listener = threading.Thread(
                         target=_iopub_listener,
-                        args=(route, tgt, events, stop, cell_codes), daemon=True)
+                        args=(route, tgt, events, stop, cell_codes, js, rdy),
+                        daemon=True)
                     listener.start()
+                    rdy.wait(8)  # subscription established before we rely on it
 
             try:
                 kid0 = _notebook_kernel_id(required=False)
                 if kid0 is not None:
                     ok0, runs0 = _target_sessions(kid0)
-                    if ok0 and runs0:
-                        session_existed = True
-                        try:
-                            route0 = _mint_route(str(min(runs0)))
-                            _, sb0 = _fetch_json(f"{route0}/api/sessions")
-                            tgt0 = next((s.get("kernel", {}).get("id")
-                                         for s in (sb0 or [])
-                                         if isinstance(s, dict)
-                                         and s.get("path") == "__notebook_source__.ipynb"),
-                                        None)
-                            _, cb0 = _fetch_json(
-                                f"{route0}/api/contents/__notebook_source__.ipynb?content=1")
-                            nb0 = (cb0 or {}).get("content") if isinstance(cb0, dict) else None
-                            if isinstance(nb0, dict):
-                                pre_counts = _nb_max_exec(nb0)
-                                cell_codes = _cells_of(nb0)
-                            if tgt0:
-                                _attach_listener(route0, tgt0)
-                        except SystemExit:
-                            pass  # pre-click snapshot is best-effort
+                    if ok0:
+                        session_existed = bool(runs0)
+                        if runs0:
+                            try:
+                                route0 = _mint_route(str(min(runs0)))
+                                _, sb0 = _fetch_json(f"{route0}/api/sessions")
+                                ent = next((s for s in (sb0 or [])
+                                            if isinstance(s, dict)
+                                            and s.get("path") == "__notebook_source__.ipynb"),
+                                           None)
+                                if ent:
+                                    jsess = ent.get("id")
+                                _, cb0 = _fetch_json(
+                                    f"{route0}/api/contents/__notebook_source__.ipynb?content=1")
+                                nb0 = (cb0 or {}).get("content") if isinstance(cb0, dict) else None
+                                if isinstance(nb0, dict):
+                                    pre_counts = _nb_max_exec(nb0)
+                                    cell_codes = _cells_of(nb0)
+                                if ent:
+                                    _attach_listener(route0,
+                                                     ent.get("kernel", {}).get("id"), jsess)
+                            except SystemExit:
+                                pass  # best-effort pre-click snapshot
             except SystemExit:
                 pass
             t_click = time.time()
@@ -676,10 +685,12 @@ def _headless_action(action, wait=30, timeout=240):
             if "clicked" not in str(r):
                 return 1
             try:
+                late_note = False
                 t0 = t_click
                 while time.time() - t0 < timeout:
                     if any(e > t_click for e in events):
-                        print("run-all executing (execute_input for this notebook's cells)")
+                        print("run-all executing (execute_input from the editor "
+                              "for this notebook's cells)")
                         return 0
                     kid = _notebook_kernel_id(required=False)
                     if kid is not None:
@@ -696,18 +707,29 @@ def _headless_action(action, wait=30, timeout=240):
                                         or not isinstance(sbody, list)):
                                     time.sleep(3)
                                     continue
-                                tgt = next((s.get("kernel", {}).get("id")
-                                            for s in sbody
+                                ent = next((s for s in sbody
                                             if s.get("path") == "__notebook_source__.ipynb"),
                                            None)
-                                if tgt is None:
+                                if ent is None:
                                     time.sleep(3)
                                     continue
-                                _attach_listener(route, tgt)  # late subscribe (fresh session)
-                                if not session_existed:
-                                    # fresh kernel starts idle: busy here IS our click
+                                if jsess is None:
+                                    jsess = ent.get("id")
+                                if listener is None:
+                                    # fresh session: we subscribe AFTER the click;
+                                    # execution may already be over — flag it
+                                    late_note = True
+                                    if cell_codes is None:
+                                        _, cb0 = _fetch_json(
+                                            f"{route}/api/contents/__notebook_source__.ipynb?content=1")
+                                        nb0 = (cb0 or {}).get("content") if isinstance(cb0, dict) else None
+                                        cell_codes = _cells_of(nb0)
+                                    _attach_listener(route,
+                                                     ent.get("kernel", {}).get("id"), jsess)
+                                if session_existed is False:
+                                    # provably fresh kernel: busy here IS our click
                                     for k in kbody:
-                                        if (k.get("id") == tgt
+                                        if (k.get("id") == ent.get("kernel", {}).get("id")
                                                 and k.get("execution_state") == "busy"):
                                             print("run-all executing (fresh session busy)")
                                             return 0
@@ -722,8 +744,15 @@ def _headless_action(action, wait=30, timeout=240):
                             except SystemExit:
                                 pass  # route mint flaky; keep polling
                     time.sleep(3)
-                print(f"execution not confirmed within {timeout}s — no causal evidence "
-                      "(matched execute_input / live-count advance / fresh-session busy)",
+                reason = ("no causal evidence: matched editor execute_input / "
+                          "live-count advance / provably-fresh busy")
+                if session_existed is None:
+                    reason += "; NOTE pre-click session state was unknown, so " \
+                              "pre-existing busy could not be used as evidence"
+                if late_note:
+                    reason += "; NOTE subscription began after the click — " \
+                              "very fast cells may have finished unobserved"
+                print(f"execution not confirmed within {timeout}s — {reason}",
                       file=sys.stderr)
                 return 1
             finally:
@@ -824,11 +853,14 @@ def _fetch_json(url):
         return int(code or 0), None
 
 
-def _iopub_listener(route, kernel_id, events, stop, cell_codes=None):
-    """Background thread: record timestamps of execute_input messages on the
-    target kernel whose code matches one of THIS notebook's cells — the
-    association that ties execution to a Run All of this notebook (other
-    kernels are excluded by the channel; unrelated code by the allowlist)."""
+def _iopub_listener(route, kernel_id, events, stop, cell_codes=None,
+                    jupyter_session=None, ready=None):
+    """Record timestamps of execute_input messages on the target kernel that
+    come from the WEB EDITOR's jupyter session (header.session match) AND
+    whose code matches one of this notebook's cells. Association layers:
+    channel -> kernel, header.session -> the editor client, code -> this
+    notebook. Residual: a Run All queued before our click in the same editor.
+    `ready` is set once the websocket is subscribed (callers wait on it)."""
     import websocket
 
     def _txt(src):
@@ -840,6 +872,8 @@ def _iopub_listener(route, kernel_id, events, stop, cell_codes=None):
         ws = websocket.create_connection(url, timeout=10, suppress_origin=False,
                                          origin=route)
         ws.settimeout(3)
+        if ready is not None:
+            ready.set()  # subscribed; messages will now be observed
         while not stop["v"]:
             try:
                 m = json.loads(ws.recv())
@@ -848,11 +882,18 @@ def _iopub_listener(route, kernel_id, events, stop, cell_codes=None):
             except Exception:
                 return
             mt = m.get("msg_type") or m.get("header", {}).get("msg_type")
-            if mt == "execute_input":
-                if allow is None or _txt((m.get("content") or {}).get("code")) in allow:
-                    events.append(time.time())
+            if mt != "execute_input":
+                continue
+            hdr = m.get("header") or {}
+            if jupyter_session and hdr.get("session") != jupyter_session:
+                continue  # a different client's request — not our run-all
+            if allow is None or _txt((m.get("content") or {}).get("code")) in allow:
+                events.append(time.time())
     except Exception:
         return
+    finally:
+        if ready is not None:
+            ready.set()  # failed to connect: don't block the caller forever
 
 
 def _nb_max_exec(nb):

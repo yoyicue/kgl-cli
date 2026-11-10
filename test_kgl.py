@@ -867,7 +867,7 @@ t_cache_retry_mismatch()
 
 # --- FULL run-all path through _headless_action (mocked chrome + APIs) -------
 def _runall_scenario(name, *, pre_session=True, busy=False,
-                     exec_input=False, want_rc=0, want_msg=""):
+                     exec_input=False, pre_unknown=False, want_rc=0, want_msg=""):
     """Drive the REAL _headless_action("run-all") with chrome fully faked."""
     import websocket as wsmod
     orig = {f: getattr(kgl, f) for f in
@@ -896,7 +896,15 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
                                   "domain": ".kaggle.com"}]
     kgl._notebook_slug = lambda: "owner/nb"
     kgl._notebook_kernel_id = lambda required=True: 111
-    kgl._target_sessions = lambda kid: (True, {777})
+    if pre_unknown:
+        # first call (pre-click) fails => unknown state; later calls succeed
+        calls = {"n": 0}
+        def tgt(kid):
+            calls["n"] += 1
+            return (False, None) if calls["n"] == 1 else (True, {777})
+        kgl._target_sessions = tgt
+    else:
+        kgl._target_sessions = lambda kid: (True, {777})
     kgl._mint_route = lambda w=None: "https://route/proxy"
     NB_LIVE = {"cells": [{"cell_type": "code", "source": "print(1)",
                           "execution_count": 5}]}
@@ -912,7 +920,10 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
         return 200, {}
     kgl._fetch_json = fake_fetch
 
-    def fake_listener(route, kid, events, stop, cell_codes=None):
+    def fake_listener(route, kid, events, stop, cell_codes=None,
+                      jupyter_session=None, ready=None):
+        if ready is not None:
+            ready.set()
         if exec_input:
             events.append(time.time() + 3600)  # guaranteed > t_click
 
@@ -988,6 +999,9 @@ def t_runall_full_paths():
                      want_rc=0, want_msg="execute_input")
     # 3. idle everywhere, no evidence -> fail honestly
     _runall_scenario("no evidence", busy=False, exec_input=False, want_rc=1)
+    # 4. pre-click state UNKNOWN + busy later -> must NOT pass (reviewer case)
+    _runall_scenario("unknown pre-state busy", busy=True, exec_input=False,
+                     pre_unknown=True, want_rc=1)
 
 
 t_runall_full_paths()
@@ -1054,6 +1068,55 @@ def t_iopub_listener():
 
 
 t_iopub_listener()
+
+
+# --- listener: header.session attribution + ready event ---------------------
+def t_listener_attribution():
+    import threading, websocket as wsmod
+    msgs = iter([
+        # wrong client session -> ignored
+        json.dumps({"msg_type": "execute_input",
+                    "header": {"session": "OTHER"},
+                    "content": {"code": "print(1)"}}),
+        # right client, right code -> recorded
+        json.dumps({"msg_type": "execute_input",
+                    "header": {"session": "ED"},
+                    "content": {"code": "print(1)"}}),
+        # right client, foreign code -> ignored
+        json.dumps({"msg_type": "execute_input",
+                    "header": {"session": "ED"},
+                    "content": {"code": "import os; os.system('x')"}}),
+    ])
+    class FW:
+        def settimeout(self, t): pass
+        def recv(self):
+            try:
+                return next(msgs)
+            except StopIteration:
+                import time as _t; _t.sleep(0.05)
+                raise wsmod.WebSocketTimeoutException()
+        def close(self): pass
+    real_conn = wsmod.create_connection
+    wsmod.create_connection = lambda *a, **k: FW()
+    try:
+        events, stop, rdy = [], {"v": False}, threading.Event()
+        th = threading.Thread(target=kgl._iopub_listener,
+                              args=("https://r", "K", events, stop,
+                                    ["print(1)"], "ED", rdy), daemon=True)
+        th.start()
+        check("ready signaled", rdy.wait(5))
+        for _ in range(50):
+            if len(events) >= 1:
+                break
+            time.sleep(0.1)
+        stop["v"] = True
+        check("only attributed execute_input recorded", len(events) == 1,
+              str(len(events)))
+    finally:
+        wsmod.create_connection = real_conn
+
+
+t_listener_attribution()
 
 
 # --- 7. import side effects land in the sandboxed HOME ---------------------
