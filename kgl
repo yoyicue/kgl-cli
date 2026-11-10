@@ -620,8 +620,6 @@ def _headless_action(action, wait=30, timeout=240):
             #      did not exist before the click (fresh kernel starts idle).
             #      Unknown pre-click state => busy proves nothing.
             import threading
-            events, stop = [], {"v": False}
-            listener = None
             pre_counts = None
             cell_codes = None
             jsess = None           # web editor's jupyter session id
@@ -634,20 +632,31 @@ def _headless_action(action, wait=30, timeout=240):
                 return [c.get("source") for c in nb.get("cells", [])
                         if isinstance(c, dict) and c.get("cell_type") == "code"]
 
+            listener = None       # the only consulted subscription box
+            warned = [False]
+
             def _attach_listener(route, tgt, js):
+                """Start one subscription attempt; return its box ONLY when
+                the handshake succeeded. Failed attempts are cancelled so a
+                late connection can never feed events into the verdict."""
                 nonlocal listener
-                if listener is None:
-                    rdy = threading.Event()
-                    listener = threading.Thread(
-                        target=_iopub_listener,
-                        args=(route, tgt, events, stop, cell_codes, js, rdy),
-                        daemon=True)
-                    listener.start()
-                    if not rdy.wait(10) or not getattr(rdy, "_kgl_status", {}).get("ok"):
-                        print("WARNING: iopub subscription not established — "
-                              "verification limited (fast cells unverifiable)",
-                              file=sys.stderr, flush=True)
-                        listener = None  # not subscribed; allow no false comfort
+                if listener is not None:
+                    return listener
+                box = {"events": [], "stop": {"v": False}, "ok": False,
+                       "ready": threading.Event()}
+                threading.Thread(target=_iopub_listener,
+                                 args=(route, tgt, box, cell_codes, js),
+                                 daemon=True).start()
+                if box["ready"].wait(10) and box["ok"]:
+                    listener = box
+                    return box
+                box["stop"]["v"] = True  # cancel; its events stay unread
+                if not warned[0]:
+                    warned[0] = True
+                    print("WARNING: iopub subscription not established — "
+                          "verification limited to provably-fresh busy",
+                          file=sys.stderr, flush=True)
+                return None
 
             try:
                 kid0 = _notebook_kernel_id(required=False)
@@ -664,6 +673,11 @@ def _headless_action(action, wait=30, timeout=240):
                                             and s.get("path") == "__notebook_source__.ipynb"),
                                            None)
                                 if ent:
+                                    # REST session id as the editor-client proxy:
+                                    # if Kaggle's frontend uses a different
+                                    # client id, no event ever matches and the
+                                    # result is an honest rc 1, never a
+                                    # false positive
                                     jsess = ent.get("id")
                                 _, cb0 = _fetch_json(
                                     f"{route0}/api/contents/__notebook_source__.ipynb?content=1")
@@ -689,7 +703,8 @@ def _headless_action(action, wait=30, timeout=240):
                 late_note = False
                 t0 = t_click
                 while time.time() - t0 < timeout:
-                    if any(e > t_click for e in events):
+                    if listener is not None and \
+                       any(e > t_click for e in listener["events"]):
                         print("run-all executing (execute_input from the editor "
                               "for this notebook's cells)")
                         return 0
@@ -749,7 +764,8 @@ def _headless_action(action, wait=30, timeout=240):
                       file=sys.stderr)
                 return 1
             finally:
-                stop["v"] = True
+                if listener is not None:
+                    listener["stop"]["v"] = True
         if action == "save":
             kid_now = _notebook_kernel_id()
             before = None                       # refuse a failed baseline
@@ -846,33 +862,37 @@ def _fetch_json(url):
         return int(code or 0), None
 
 
-def _iopub_listener(route, kernel_id, events, stop, cell_codes=None,
-                    jupyter_session=None, ready=None):
-    """Record timestamps of execute_input broadcasts on the target kernel that
-    originate from the WEB EDITOR's client. Per the jupyter message protocol,
-    a kernel-broadcast header.session identifies the KERNEL; the requesting
-    client appears in parent_header.session — which is what /api/sessions'
-    session id matches. Association layers: channel -> kernel,
-    parent_header.session -> the editor client, code -> this notebook's cells.
-    Residual: a Run All queued before our click in the same editor.
-    `ready` (Event) is set only with status["ok"] reflecting subscription."""
+def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None):
+    """Subscribe to the target kernel's iopub and record ATTRIBUTED
+    execute_input timestamps into box["events"].
+
+    Attribution requires BOTH the originating-client id (parent_header.session
+    per the message protocol — NOT header.session, which identifies the
+    kernel) and the notebook's cell codes. If either is unknown, nothing is
+    recorded: absence of attribution information means UNCONFIRMED, never
+    accept-any-execution.
+
+    box: {"events": [], "stop": {"v": bool}, "ok": bool, "ready": Event}.
+    ready is set once the outcome is decided; ok=True only on successful
+    subscription. A cancelled box (stop set by the caller after a failed
+    handshake) may still connect late — its events are never consulted."""
     import websocket
 
     def _txt(src):
         return "".join(src) if isinstance(src, list) else str(src or "")
 
-    allow = {_txt(c) for c in (cell_codes or [])} or None
-    if ready is not None and not hasattr(ready, "_kgl_status"):
-        ready._kgl_status = {"ok": False}
+    if not cell_codes or not jupyter_session:
+        box["ready"].set()  # cannot attribute anything; caller sees ok=False
+        return
+    allow = {_txt(c) for c in cell_codes}
     try:
         url = route.replace("https://", "wss://") + f"/api/kernels/{kernel_id}/channels"
         ws = websocket.create_connection(url, timeout=10, suppress_origin=False,
                                          origin=route)
         ws.settimeout(3)
-        if ready is not None:
-            ready._kgl_status["ok"] = True  # subscribed
-            ready.set()
-        while not stop["v"]:
+        box["ok"] = True
+        box["ready"].set()
+        while not box["stop"]["v"]:
             try:
                 m = json.loads(ws.recv())
             except websocket.WebSocketTimeoutException:
@@ -882,14 +902,13 @@ def _iopub_listener(route, kernel_id, events, stop, cell_codes=None,
             mt = m.get("msg_type") or m.get("header", {}).get("msg_type")
             if mt != "execute_input":
                 continue
-            # the ORIGINATING CLIENT lives in parent_header (kernel speaks
-            # in header; protocol docs: parent identifies the request source)
             parent = m.get("parent_header") or {}
-            if jupyter_session and parent.get("session") != jupyter_session:
-                continue  # another client's request — not our run-all
-            if allow is None or _txt((m.get("content") or {}).get("code")) in allow:
-                events.append(time.time())
+            if parent.get("session") != jupyter_session:
+                continue  # another client's request
+            if _txt((m.get("content") or {}).get("code")) in allow:
+                box["events"].append(time.time())
     except Exception:
+        box["ready"].set()  # failed to connect; ok stays False
         return
 
 

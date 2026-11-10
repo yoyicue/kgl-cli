@@ -920,12 +920,11 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
         return 200, {}
     kgl._fetch_json = fake_fetch
 
-    def fake_listener(route, kid, events, stop, cell_codes=None,
-                      jupyter_session=None, ready=None):
-        if ready is not None:
-            ready.set()
+    def fake_listener(route, kid, box, cell_codes=None, jupyter_session=None):
+        box["ok"] = True
+        box["ready"].set()
         if exec_input:
-            events.append(time.time() + 3600)  # guaranteed > t_click
+            box["events"].append(time.time() + 3600)  # guaranteed > t_click
 
     kgl._iopub_listener = fake_listener
     kgl.time = types.SimpleNamespace(time=kgl.time.time,
@@ -1029,53 +1028,13 @@ t_runall_causal_signals()
 
 
 # --- _iopub_listener records execute_input only -------------------------------
-def t_iopub_listener():
-    import threading, websocket as wsmod
-    real_conn = wsmod.create_connection
-    class FakeWS:
-        def __init__(self, *a, **k): self.msgs = iter([
-            '{"msg_type":"status","content":{"execution_state":"busy"}}',
-            '{"msg_type":"execute_input","content":{"code":"x=1"}}',
-            '{"header":{"msg_type":"execute_input"}}',
-            "not-json",
-        ]); self.sentinel = False
-        def settimeout(self, t): pass
-        def recv(self):
-            try:
-                import time as _t; _t.sleep(0.01)
-                return next(self.msgs)
-            except StopIteration:
-                import time as _t; _t.sleep(0.05)
-                raise wsmod.WebSocketTimeoutException()
-        def close(self): pass
-    wsmod.create_connection = lambda *a, **k: FakeWS()
-    try:
-        events, stop = [], {"v": False}
-        th = threading.Thread(target=kgl._iopub_listener,
-                              args=("https://r", "K", events, stop), daemon=True)
-        th.start()
-        import time as _t
-        for _ in range(50):
-            if len(events) >= 2:
-                break
-            _t.sleep(0.1)
-        stop["v"] = True
-        check("execute_input recorded (both header shapes)",
-              len(events) == 2, str(events))
-        check("status messages ignored", len(events) == 2)
-    finally:
-        wsmod.create_connection = real_conn
 
 
-t_iopub_listener()
-
-
-# --- listener: header.session attribution + ready event ---------------------
+# --- listener: parent_header attribution (box contract) ---------------------
 def t_listener_attribution():
     import threading, websocket as wsmod
     msgs = iter([
-        # kernel speaks in header.session; originating client in parent_header
-        # wrong originating client -> ignored
+        # wrong originating client (parent_header) -> ignored
         json.dumps({"msg_type": "execute_input",
                     "header": {"session": "KERNEL"},
                     "parent_header": {"session": "OTHER"},
@@ -1089,7 +1048,7 @@ def t_listener_attribution():
         json.dumps({"msg_type": "execute_input",
                     "header": {"session": "KERNEL"},
                     "parent_header": {"session": "ED"},
-                    "content": {"code": "import os; os.system('x')"}}),
+                    "content": {"code": "import os"}}),
     ])
     class FW:
         def settimeout(self, t): pass
@@ -1097,30 +1056,58 @@ def t_listener_attribution():
             try:
                 return next(msgs)
             except StopIteration:
-                import time as _t; _t.sleep(0.05)
                 raise wsmod.WebSocketTimeoutException()
         def close(self): pass
     real_conn = wsmod.create_connection
     wsmod.create_connection = lambda *a, **k: FW()
     try:
-        events, stop, rdy = [], {"v": False}, threading.Event()
+        box = {"events": [], "stop": {"v": False}, "ok": False,
+               "ready": threading.Event()}
         th = threading.Thread(target=kgl._iopub_listener,
-                              args=("https://r", "K", events, stop,
-                                    ["print(1)"], "ED", rdy), daemon=True)
+                              args=("https://r", "K", box, ["print(1)"], "ED"),
+                              daemon=True)
         th.start()
-        check("ready signaled", rdy.wait(5))
+        check("box ready + ok", box["ready"].wait(5) and box["ok"])
         for _ in range(50):
-            if len(events) >= 1:
+            if box["events"]:
                 break
             time.sleep(0.1)
-        stop["v"] = True
-        check("only attributed execute_input recorded", len(events) == 1,
-              str(len(events)))
+        box["stop"]["v"] = True
+        check("only attributed execute_input recorded", len(box["events"]) == 1)
     finally:
         wsmod.create_connection = real_conn
 
 
 t_listener_attribution()
+
+
+# --- missing attribution info => records NOTHING (unconfirmed) ---------------
+def t_listener_no_attribution_info():
+    import threading, websocket as wsmod
+    class FW:
+        def settimeout(self, t): pass
+        def recv(self):
+            raise wsmod.WebSocketTimeoutException()
+        def close(self): pass
+    real_conn = wsmod.create_connection
+    wsmod.create_connection = lambda *a, **k: FW()
+    try:
+        for cc, js in [(None, "ED"), (["x"], None), (None, None)]:
+            box = {"events": [], "stop": {"v": False}, "ok": False,
+                   "ready": threading.Event()}
+            th = threading.Thread(target=kgl._iopub_listener,
+                                  args=("https://r", "K", box, cc, js),
+                                  daemon=True)
+            th.start()
+            box["ready"].wait(5)
+            box["stop"]["v"] = True
+            check(f"no attribution info ({bool(cc)},{bool(js)}) -> not ok, no events",
+                  box["ok"] is False and box["events"] == [])
+    finally:
+        wsmod.create_connection = real_conn
+
+
+t_listener_no_attribution_info()
 
 
 # --- listener ready semantics: success vs connection failure -----------------
@@ -1137,30 +1124,34 @@ def t_listener_ready_semantics():
     class FailConn:
         def __init__(self, *a, **k): raise OSError("refused")
 
-    for fake, want_ok, name in [(lambda *a, **k: OkW(), True, "ok"),
-                                (lambda *a, **k: FailConn(), False, "conn-fail")]:
-        wsmod.create_connection = fake
-        try:
-            events, stop, rdy = [], {"v": False}, threading.Event()
-            th = threading.Thread(target=kgl._iopub_listener,
-                                  args=("https://r", "K", events, stop, None, None, rdy),
-                                  daemon=True)
-            th.start()
-            got = rdy.wait(2 if not want_ok else 5)
-            if want_ok:
-                check(f"ready[{name}] set", got)
-                check(f"ready[{name}] status ok", rdy._kgl_status["ok"] is True)
-            else:
-                check(f"ready[{name}] NOT set on failure", got is False)
-            stop["v"] = True
-        finally:
-            wsmod.create_connection = real_conn
+    # success: ready set + ok True
+    wsmod.create_connection = lambda *a, **k: OkW()
+    try:
+        box = {"events": [], "stop": {"v": False}, "ok": False,
+               "ready": threading.Event()}
+        threading.Thread(target=kgl._iopub_listener,
+                         args=("https://r", "K", box, ["c"], "ED"), daemon=True).start()
+        check("conn ok -> ready+ok", box["ready"].wait(5) and box["ok"] is True)
+        box["stop"]["v"] = True
+    finally:
+        wsmod.create_connection = real_conn
+    # failure: ready set, ok False (caller cancels; events never read)
+    wsmod.create_connection = lambda *a, **k: FailConn()
+    try:
+        box = {"events": [], "stop": {"v": False}, "ok": False,
+               "ready": threading.Event()}
+        threading.Thread(target=kgl._iopub_listener,
+                         args=("https://r", "K", box, ["c"], "ED"), daemon=True).start()
+        check("conn fail -> ready set, ok False",
+              box["ready"].wait(5) and box["ok"] is False)
+    finally:
+        wsmod.create_connection = real_conn
 
 
 t_listener_ready_semantics()
 
 
-# --- 7. import side effects land in the sandboxed HOME ---------------------
+# --- 7. import side effects# --- 7. import side effects land in the sandboxed HOME ---------------------
 def t_home_isolated():
     cfg = os.path.join(TMP, ".config", "kgl")
     check("config created under fake HOME", os.path.isdir(cfg))
