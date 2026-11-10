@@ -975,6 +975,7 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
     def fake_listener(route, kid, box, cell_codes=None, jupyter_session=None):
         box["ok"] = True
         box["ready"].set()
+        box["sent"].add("EDITOR")  # CDP harvester: our iframe spoke
         if exec_input == "queued-first-only":
             # a pre-queued FIRST cell alone (arrives after the click)
             box["events"].append((time.time() + 3600, first_cell))
@@ -1167,25 +1168,21 @@ def t_listener_attribution():
     wsmod.create_connection = lambda *a, **k: FW()
     try:
         box = {"events": [], "stop": {"v": False}, "ok": False,
-               "ready": threading.Event(), "clients": set(), "accepted": set()}
+               "ready": threading.Event(), "clients": set(), "sent": set()}
         th = threading.Thread(target=kgl._iopub_listener,
                               args=("https://r", "K", box, ["print(1)"], None),
                               daemon=True)
         th.start()
         check("box ready + ok", box["ready"].wait(5) and box["ok"])
-        # snapshot the learned clients as 'accepted' (the click moment)
-        for _ in range(50):
-            if "ED" in box["clients"]:
-                break
-            time.sleep(0.1)
-        box["accepted"] = set(box["clients"])  # BEFORE the OTHER client appears
+        # the CDP harvester discovered our page's iframe spoke for "ED"
+        box["sent"].add("ED")
         for _ in range(60):
             if box["events"]:
                 break
             time.sleep(0.15)
         box["stop"]["v"] = True
         check("editor client learned", "ED" in box["clients"])
-        check("only accepted+matching execute_input recorded",
+        check("only sent-from-our-page execute_input recorded",
               len(box["events"]) == 1 and box["events"][0][1] == "print(1)",
               f"events={box['events']} clients={box['clients']}")
     finally:
@@ -1208,7 +1205,7 @@ def t_listener_no_attribution_info():
     try:
         for cc, js in [(None, "ED"), (None, None)]:
             box = {"events": [], "stop": {"v": False}, "ok": False,
-                   "ready": threading.Event(), "clients": set(), "accepted": set()}
+                   "ready": threading.Event(), "clients": set(), "sent": set()}
             th = threading.Thread(target=kgl._iopub_listener,
                                   args=("https://r", "K", box, cc, js),
                                   daemon=True)

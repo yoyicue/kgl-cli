@@ -78,7 +78,7 @@ the full adventure.
 ## Test
 
 ```bash
-python3 test_kgl.py   # offline unit tests (no network, mocks curl)
+/usr/bin/python3 test_kgl.py   # offline unit tests (no network, mocks curl)
 ```
 
 ## License

@@ -583,6 +583,49 @@ def _headless_action(action, wait=30, timeout=240):
                                                        timeout=30, suppress_origin=True)
             return None
 
+        sent_stop = {"v": False}
+
+        def _start_sent_harvester():
+            """Attach CDP Network to the editor's jupyter iframe; every
+            webSocketFrameSent payload's header.session is a client id OUR
+            page spoke for. Fills listener["sent"] (verdicts gate on it)."""
+            try:
+                tabs = json.loads(subprocess.check_output(
+                    ["curl", "-s", "--noproxy", "*", "-m", "3",
+                     f"http://localhost:{port}/json/list"]))
+                fr = next((t for t in tabs if t.get("type") == "iframe"
+                           and "jupyter-proxy" in t.get("url", "")), None)
+                if not fr:
+                    return
+                import websocket as _ws
+
+                def run():
+                    try:
+                        hws = _ws.create_connection(fr["webSocketDebuggerUrl"],
+                                                    timeout=120, suppress_origin=True)
+                        hws.send(json.dumps({"id": 1, "method": "Network.enable"}))
+                        while not sent_stop["v"]:
+                            try:
+                                m = json.loads(hws.recv())
+                            except _ws.WebSocketTimeoutException:
+                                continue
+                            except Exception:
+                                return
+                            if m.get("method") == "Network.webSocketFrameSent":
+                                try:
+                                    payload = json.loads(
+                                        m["params"]["response"]["payloadData"])
+                                    cid = (payload.get("header") or {}).get("session")
+                                    if cid and listener is not None:
+                                        listener["sent"].add(cid)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        return
+                threading.Thread(target=run, daemon=True).start()
+            except Exception:
+                pass
+
         def _iframe_ready():
             """Editor's jupyter iframe target exists again after a reload."""
             try:
@@ -692,7 +735,7 @@ def _headless_action(action, wait=30, timeout=240):
                     return listener
                 box = {"events": [], "stop": {"v": False}, "ok": False,
                        "ready": threading.Event(),
-                       "clients": set(), "accepted": set()}
+                       "clients": set(), "sent": set()}
                 threading.Thread(target=_iopub_listener,
                                  args=(route, tgt, box, cell_codes, js),
                                  daemon=True).start()
@@ -757,30 +800,14 @@ def _headless_action(action, wait=30, timeout=240):
                                         # handshake (kernel_info) reveals the
                                         # editor client id, which (empirically)
                                         # is NOT the REST session id
-                                        try:
-                                            pws0 = find_tab_ws()
-                                            if pws0:
-                                                pws0.send(json.dumps(
-                                                    {"id": 9, "method": "Page.reload"}))
-                                                pws0.close()
-                                        except Exception:
-                                            pass
-                                        before = set(listener["clients"])
-                                        # wait for the editor's jupyter iframe
-                                        # to come back before clicking anywhere:
-                                        # a half-loaded page accepts the click
-                                        # as a NO-OP (learned the hard way)
-                                        for _ in range(30):
-                                            time.sleep(3)
-                                            if _iframe_ready():
-                                                time.sleep(5)  # settle
-                                                break
-                                        # DELTA attribution: only the client that
-                                        # (RE)connected at OUR reload is this
-                                        # page's editor; ids already live before
-                                        # the reload are OTHER clients
-                                        listener["accepted"] = (
-                                            set(listener["clients"]) - before)
+                                        # THE editor client id, without
+                                        # timing games: our page's iframe
+                                        # SENDS every jupyter message; CDP
+                                        # webSocketFrameSent exposes their
+                                        # header.session. Sent-from-our-page
+                                        # is causal by construction.
+                                        _start_sent_harvester()
+                                        time.sleep(8)  # editor handshake lands
                             except SystemExit:
                                 pass  # best-effort pre-click snapshot
             except SystemExit:
@@ -832,11 +859,6 @@ def _headless_action(action, wait=30, timeout=240):
                                             first_cell_code = _txt(cell_codes[0])
                                     _attach_listener(route,
                                                      ent.get("kernel", {}).get("id"), jsess)
-                                    if listener is not None and not listener["accepted"]:
-                                        # brand-new kernel: every client that
-                                        # connects now is THIS page's editor
-                                        time.sleep(6)
-                                        listener["accepted"] = set(listener["clients"])
                                 if session_existed is False:
                                     # provably fresh kernel: busy here IS our click
                                     for k in kbody:
@@ -895,6 +917,7 @@ def _headless_action(action, wait=30, timeout=240):
                       file=sys.stderr)
                 return 1
             finally:
+                sent_stop["v"] = True
                 if listener is not None:
                     listener["stop"]["v"] = True
         if action == "save":
@@ -1000,7 +1023,7 @@ def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None
     NOT the REST session id, so it must be LEARNED). Records attributed
     execute_input (ts, code) pairs: attribution = parent in the accepted set
     (ids observed before the click snapshot) and code in this notebook's cells.
-    box: {"events", "stop", "ok", "ready", "clients": set, "accepted": set}."""
+    box: {"events", "stop", "ok", "ready", "clients": set, "sent": set}."""
     import websocket
 
     def _txt(src):
@@ -1029,9 +1052,8 @@ def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None
             mt = m.get("msg_type") or m.get("header", {}).get("msg_type")
             if mt != "execute_input":
                 continue
-            accepted = box["accepted"] or ({jupyter_session} if jupyter_session else set())
-            if parent not in accepted:
-                continue  # a client we hadn't seen before the click
+            if parent not in box["sent"]:
+                continue  # not a client OUR page's iframe spoke for
             if _txt((m.get("content") or {}).get("code")) in allow:
                 box["events"].append((time.time(),
                                       _txt((m.get("content") or {}).get("code"))))
