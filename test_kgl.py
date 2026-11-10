@@ -879,13 +879,31 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
     fake_sent_ids, fake_sent_reqs = set(), []
 
     def fake_harvester(port, sent_ids, sent_reqs, stop, ready, ok):
+        # like a real subscription: stay ALIVE until stopped (production
+        # voids ok when the thread exits — a returning fake would be 'dead')
+        if exec_input == "drop-recover":
+            # full race (reviewer case): ACK ok -> DROP before the click ->
+            # reconnect after the click and observe requests -> still rc 1
+            ok[0] = True
+            ready.set()
+            time.sleep(0.3)          # pre-click: alive and confirmed...
+            ok[0] = False            # ...then the connection DROPS (run()
+            # exits; production's finally voids ok and clears harvester_on)
+            sent_ids.add("EDITOR")   # post-click recovery observes frames
+            sent_reqs.append((time.time() + 3600, first_cell))
+            sent_reqs.append((time.time() + 3600, second_cell))
+            while not stop["v"]:
+                time.sleep(0.02)
+            return
         if sub_fail:
             ready.set()  # attempt done; ok stays False (pre-click failure)
-            if exec_input == "recover":  # harvester recovers POST-click and
-                # still observes frames — must NOT upgrade the verdict (spec)
+            if exec_input == "recover":  # frames seen after a POST-click
+                # recovery must NOT upgrade the verdict (spec)
                 sent_ids.add("EDITOR")
                 sent_reqs.append((time.time() + 3600, first_cell))
                 sent_reqs.append((time.time() + 3600, second_cell))
+            while not stop["v"]:
+                time.sleep(0.02)
             return
         ok[0] = True  # subscription confirmed
         ready.set()
@@ -894,6 +912,8 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
             fake_sent_reqs.append((time.time() + 3600, first_cell))
             fake_sent_reqs.append((time.time() + 3600, second_cell))
         sent_reqs.extend(fake_sent_reqs)
+        while not stop["v"]:  # keep the 'subscription' alive until the end
+            time.sleep(0.02)
     kgl._cdp_sent_harvester = fake_harvester
     real_sleep = kgl.time.sleep
 
@@ -1016,7 +1036,7 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
             # page issued the requests (CDP sent frames) but NO kernel-side
             # evidence: must report SUBMITTED, never 'executing'
             pass
-        elif exec_input:
+        elif exec_input and exec_input not in ("recover", "drop-recover"):
             box["events"].append((time.time() + 3600, first_cell, "EDITOR"))
             box["events"].append((time.time() + 3600, second_cell, "EDITOR"))
 
@@ -1119,6 +1139,10 @@ def t_runall_full_paths():
     # 10. EMPTY second code cell doesn't make a 3-cell notebook "1-cell"
     _runall_scenario("empty middle cell", exec_input="queued-first-only",
                      empty_second=True, want_rc=1)
+    # 10x. FULL DROP RACE: ACKed, dropped pre-click, recovered post-click
+    #      with observed requests -> rc 1 (liveness check at click time)
+    _runall_scenario("acked then dropped, recovered", exec_input="drop-recover",
+                     want_rc=1)
     # 10y. subscription failed pre-click, recovered after: observed requests
     #      must NOT yield submitted (spec: pre-click unconfirmed => rc 1)
     _runall_scenario("sub fail, post-click recovery", exec_input="recover",

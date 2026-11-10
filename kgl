@@ -608,6 +608,9 @@ def _headless_action(action, wait=30, timeout=240):
                                         sent_stop, harvester_ready, harvester_ok)
                 finally:
                     harvester_on[0] = False  # exited: restart is allowed
+                    harvester_ok[0] = False  # ...and the confirmation is
+                    # VOID: a subscription that died before the click must
+                    # not authorize confirmation verdicts (drop race, spec)
             threading.Thread(target=run, daemon=True).start()
             if wait_ready:
                 harvester_ready.wait(8)
@@ -808,7 +811,9 @@ def _headless_action(action, wait=30, timeout=240):
                 time.sleep(3)
             # if still not ok, attribution evidence is unavailable: the run
             # can at most report 'submitted'; execution confirmation is off
-            harvester_confirmed = harvester_ok[0]
+            # pre-click liveness check: ACKed earlier AND still running.
+            # A harvester that dropped after its ACK is NOT a subscription.
+            harvester_confirmed = harvester_on[0] and harvester_ok[0]
             t_click = time.time()
             t_click = time.time()
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
