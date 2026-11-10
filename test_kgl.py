@@ -868,7 +868,7 @@ t_cache_retry_mismatch()
 # --- FULL run-all path through _headless_action (mocked chrome + APIs) -------
 def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
                      exec_input=False, pre_unknown=False, first_run=False,
-                     empty_second=False, want_rc=0, want_msg=""):
+                     empty_second=False, identical=False, want_rc=0, want_msg=""):
     """Drive the REAL _headless_action("run-all") with chrome fully faked."""
     import websocket as wsmod
     orig = {f: getattr(kgl, f) for f in
@@ -945,6 +945,10 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
                           "execution_count": 5},
                          {"cell_type": "code", "source": "print(2)",
                           "execution_count": 6}]}
+    if identical:
+        NB_LIVE = {"cells": [
+            {"cell_type": "code", "source": first_cell, "execution_count": 5},
+            {"cell_type": "code", "source": first_cell, "execution_count": 6}]}
     if empty_second:
         NB_LIVE = {"cells": [
             {"cell_type": "code", "source": first_cell, "execution_count": 5},
@@ -981,6 +985,11 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
             box["events"].append((time.time() + 3600, second_cell))
         elif exec_input == "long-first":
             # first cell fires and keeps running (kernel busy, no second cell)
+            box["events"].append((time.time() + 3600, first_cell))
+        elif exec_input == "identical-one":
+            box["events"].append((time.time() + 3600, first_cell))
+        elif exec_input == "identical-two":
+            box["events"].append((time.time() + 3600, first_cell))
             box["events"].append((time.time() + 3600, first_cell))
         elif exec_input:
             box["events"].append((time.time() + 3600, first_cell))
@@ -1082,6 +1091,12 @@ def t_runall_full_paths():
     # 10. EMPTY second code cell doesn't make a 3-cell notebook "1-cell"
     _runall_scenario("empty middle cell", exec_input="queued-first-only",
                      empty_second=True, want_rc=1)
+    # 11. IDENTICAL first/second cell code: one event must NOT verify;
+    #     two events must (regression for the distinct-event requirement)
+    _runall_scenario("identical cells, single event", exec_input="identical-one",
+                     identical=True, want_rc=1)
+    _runall_scenario("identical cells, both events", exec_input="identical-two",
+                     identical=True, want_rc=0, want_msg="Run-All-shaped")
 
 
 t_runall_full_paths()
