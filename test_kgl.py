@@ -882,19 +882,17 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
         # like a real subscription: stay ALIVE until stopped (production
         # voids ok when the thread exits — a returning fake would be 'dead')
         if exec_input == "drop-recover":
-            # full race (reviewer case): ACK ok -> DROP before the click ->
-            # reconnect after the click and observe requests -> still rc 1
+            # full race (reviewer case): ACK ok, frames observed, then the
+            # connection DROPS (thread exits — production's finally voids ok
+            # and clears harvester_on; pre-click retries can't revive it).
+            # At click time the subscription is dead => confirmed False,
+            # yet reqs exist => the timeout fallback must still refuse.
             ok[0] = True
             ready.set()
-            time.sleep(0.3)          # pre-click: alive and confirmed...
-            ok[0] = False            # ...then the connection DROPS (run()
-            # exits; production's finally voids ok and clears harvester_on)
-            sent_ids.add("EDITOR")   # post-click recovery observes frames
+            sent_ids.add("EDITOR")
             sent_reqs.append((time.time() + 3600, first_cell))
             sent_reqs.append((time.time() + 3600, second_cell))
-            while not stop["v"]:
-                time.sleep(0.02)
-            return
+            return  # drop: wrapper's finally voids ok/on deterministically
         if sub_fail:
             ready.set()  # attempt done; ok stays False (pre-click failure)
             if exec_input == "recover":  # frames seen after a POST-click
