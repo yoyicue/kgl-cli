@@ -630,10 +630,17 @@ def _headless_action(action, wait=30, timeout=240):
             session_existed = None
 
             def _cells_of(nb):
+                """Non-empty code cell sources. Empty code cells never issue
+                execute requests and must not count as the 'second cell'."""
                 if not isinstance(nb, dict):
                     return None
-                return [c.get("source") for c in nb.get("cells", [])
-                        if isinstance(c, dict) and c.get("cell_type") == "code"]
+                out = []
+                for c in nb.get("cells", []):
+                    if isinstance(c, dict) and c.get("cell_type") == "code":
+                        t = _txt(c.get("source"))
+                        if t.strip():
+                            out.append(c.get("source"))
+                return out
 
             def _txt(src):
                 return "".join(src) if isinstance(src, list) else str(src or "")
@@ -642,6 +649,7 @@ def _headless_action(action, wait=30, timeout=240):
 
             listener = None       # the only consulted subscription box
             warned = [False]
+            pre_kernel_idle = None  # True/False observed pre-click; None=unknown
 
             def _attach_listener(route, tgt, js):
                 """Start one subscription attempt; return its box ONLY when
@@ -693,6 +701,14 @@ def _headless_action(action, wait=30, timeout=240):
                                     # result is an honest rc 1, never a
                                     # false positive
                                     jsess = ent.get("id")
+                                _, kb0 = _fetch_json(f"{route0}/api/kernels")
+                                if isinstance(kb0, list):
+                                    k0 = next((k for k in kb0
+                                               if k.get("id") == (ent or {}).get(
+                                                   "kernel", {}).get("id")), None)
+                                    if k0 is not None:
+                                        pre_kernel_idle = (k0.get("execution_state")
+                                                           == "idle")
                                 _, cb0 = _fetch_json(
                                     f"{route0}/api/contents/__notebook_source__.ipynb?content=1")
                                 nb0 = (cb0 or {}).get("content") if isinstance(cb0, dict) else None
@@ -785,11 +801,17 @@ def _headless_action(action, wait=30, timeout=240):
                                             print("run-all executing (attributed "
                                                   "Run-All-shaped sequence)")
                                             return 0
-                                        if any(k.get("id") == ent.get("kernel", {}).get("id")
-                                               and k.get("execution_state") == "busy"
-                                               for k in kbody):
+                                        # idle->busy transition after the click +
+                                        # an ATTRIBUTED first-cell event: the
+                                        # pre-click-idle kernel cannot have been
+                                        # running pre-existing work. Busy since
+                                        # before the click is NOT evidence.
+                                        if pre_kernel_idle is True and any(
+                                                k.get("id") == ent.get("kernel", {}).get("id")
+                                                and k.get("execution_state") == "busy"
+                                                for k in kbody):
                                             print("run-all executing (attributed "
-                                                  "first cell still running)")
+                                                  "first cell; idle kernel turned busy)")
                                             return 0
                             except SystemExit:
                                 pass  # route mint flaky; keep polling

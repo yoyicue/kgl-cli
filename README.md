@@ -42,9 +42,12 @@ kgl put local remote                # upload (auto-mkdir parents)
   These actions drive the Kaggle editor in an isolated headless chrome
   (ephemeral profile, auto-allocated CDP port) and verify the outcome
   server-side before exiting. `run-all` exit 0 means execution was observed
-  with attribution (client + notebook + Run-All-shaped sequence); a Run All
-  queued in the same editor BEFORE the click is externally indistinguishable
-  and remains a documented limit — treat 0 as 'verified within these limits'.
+  with attribution (client + notebook + Run-All-shaped sequence, or an
+  idle->busy transition tied to an attributed first cell). Limits, all
+  documented in code: a request queued in the same editor BEFORE the click
+  (single cell or full Run All) is externally indistinguishable — treat 0 as
+  'verified within these limits'. A kernel already busy before the click
+  yields rc 1 rather than guessing.
 - Cookie refresh: re-login to kaggle in any chrome with `--remote-debugging-port=9222`;
   `kgl bootstrap` picks them up and caches (verified against the API first).
 - `kgl term` is unsupported: Kaggle blocks the terminado websocket. Use `sh`/`exec`.

@@ -866,9 +866,9 @@ t_cache_retry_mismatch()
 
 
 # --- FULL run-all path through _headless_action (mocked chrome + APIs) -------
-def _runall_scenario(name, *, pre_session=True, busy=False,
+def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
                      exec_input=False, pre_unknown=False, first_run=False,
-                     want_rc=0, want_msg=""):
+                     empty_second=False, want_rc=0, want_msg=""):
     """Drive the REAL _headless_action("run-all") with chrome fully faked."""
     import websocket as wsmod
     orig = {f: getattr(kgl, f) for f in
@@ -887,6 +887,7 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
         def recv(self):
             m = self.last or {}
             if m.get("method") == "Runtime.evaluate":
+                pre["v"] = False  # the click: everything after is post-click
                 return json.dumps({"id": m.get("id", 1),
                                    "result": {"result": {"value": "runall-clicked"}}})
             return json.dumps({"id": m.get("id", 1), "result": {}})
@@ -944,16 +945,27 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
                           "execution_count": 5},
                          {"cell_type": "code", "source": "print(2)",
                           "execution_count": 6}]}
+    if empty_second:
+        NB_LIVE = {"cells": [
+            {"cell_type": "code", "source": first_cell, "execution_count": 5},
+            {"cell_type": "code", "source": "", "execution_count": None},
+            {"cell_type": "code", "source": "print(3)", "execution_count": 7}]}
+    pre = {"v": True}  # flipped to False when the CDP click is answered
+
     def fake_fetch(url):
         if "api/sessions" in url:
-            return 200, [{"path": "__notebook_source__.ipynb",
+            return 200, [{"id": "SESS1", "path": "__notebook_source__.ipynb",
                           "kernel": {"id": "K1"}}]
         if "api/kernels" in url:
-            return 200, [{"id": "K1",
-                          "execution_state": "busy" if busy else "idle"}]
+            if pre["v"]:
+                st = "busy" if pre_busy else "idle"
+            else:
+                st = "busy" if busy else "idle"
+            return 200, [{"id": "K1", "execution_state": st}]
         if "api/contents" in url:
             return 200, {"content": NB_LIVE}
         return 200, {}
+
     kgl._fetch_json = fake_fetch
 
     def fake_listener(route, kid, box, cell_codes=None, jupyter_session=None):
@@ -1059,10 +1071,17 @@ def t_runall_full_paths():
     # 7. pre-click noise must not pollute; proper post-click Run All passes
     _runall_scenario("pre-click noise", exec_input="pre-noise",
                      want_rc=0, want_msg="Run-All-shaped")
-    # 8. LONG first cell: attributed first-cell event + kernel busy -> verified
-    #    (must not wait out the timeout while the first cell trains)
+    # 8. LONG first cell: attributed first-cell event + idle->busy kernel
+    #    -> verified (must not wait out the timeout while the first cell trains)
     _runall_scenario("long first cell", exec_input="long-first", busy=True,
-                     want_rc=0, want_msg="still running")
+                     want_rc=0, want_msg="idle kernel turned busy")
+    # 9. kernel ALREADY busy pre-click + attributed first-cell event
+    #    -> busy is not evidence; queued-request must not verify
+    _runall_scenario("pre-busy + first-cell event", exec_input="long-first",
+                     pre_busy=True, want_rc=1)
+    # 10. EMPTY second code cell doesn't make a 3-cell notebook "1-cell"
+    _runall_scenario("empty middle cell", exec_input="queued-first-only",
+                     empty_second=True, want_rc=1)
 
 
 t_runall_full_paths()
