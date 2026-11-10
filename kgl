@@ -718,13 +718,19 @@ def _headless_action(action, wait=30, timeout=240):
                 t0 = t_click
                 while time.time() - t0 < timeout:
                     if listener is not None and listener["events"]:
-                        evs = [e for e in listener["events"] if e > t_click]
-                        # Run All executes from the FIRST code cell; an event
-                        # stream starting elsewhere is a queued/foreign request
-                        if evs and (first_cell_code is None or
-                                    listener.get("first_code") == first_cell_code):
-                            print("run-all executing (attributed execute_input "
-                                  "starting at the first cell)")
+                        post = [c for ts, c in listener["events"] if ts > t_click]
+                        # Run All executes cells IN ORDER from the first; a
+                        # post-click stream that starts at the first cell AND
+                        # (for multi-cell notebooks) reaches the second cell
+                        # is Run-All-shaped. A single queued cell — even the
+                        # first — does not pass. (1-cell notebooks and a
+                        # fully pre-queued Run All remain accepted limits.)
+                        seq_ok = bool(post) and post[0] == first_cell_code and (
+                            len(cell_codes or []) < 2
+                            or (cell_codes[1] and _txt(cell_codes[1]) in post))
+                        if first_cell_code is not None and seq_ok:
+                            print("run-all executing (attributed Run-All-shaped "
+                                  "execute_input sequence)")
                             return 0
                     kid = _notebook_kernel_id(required=False)
                     if kid is not None:
@@ -927,9 +933,10 @@ def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None
                 continue  # another client's request
             code = _txt((m.get("content") or {}).get("code"))
             if code in allow:
-                box["events"].append(time.time())
-                if "first_code" not in box:
-                    box["first_code"] = code  # Run All starts at the first cell
+                # (ts, code) pairs: verdicts filter by click time AND judge
+                # the SEQUENCE of post-click codes, never the listener's
+                # first-ever message
+                box["events"].append((time.time(), code))
     except Exception:
         box["ready"].set()  # failed to connect; ok stays False
         return

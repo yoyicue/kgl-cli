@@ -939,6 +939,7 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
         return "".join(src) if isinstance(src, list) else str(src or "")
 
     first_cell = "print(1)"
+    second_cell = "print(2)"
     NB_LIVE = {"cells": [{"cell_type": "code", "source": first_cell,
                           "execution_count": 5},
                          {"cell_type": "code", "source": "print(2)",
@@ -958,9 +959,17 @@ def _runall_scenario(name, *, pre_session=True, busy=False,
     def fake_listener(route, kid, box, cell_codes=None, jupyter_session=None):
         box["ok"] = True
         box["ready"].set()
-        if exec_input:
-            box["events"].append(time.time() + 3600)  # guaranteed > t_click
-            box["first_code"] = _txt(first_cell)      # Run All starts at cell 1
+        if exec_input == "queued-first-only":
+            # a pre-queued FIRST cell alone (arrives after the click)
+            box["events"].append((time.time() + 3600, first_cell))
+        elif exec_input == "pre-noise":
+            # pre-click noise (second cell), then a proper Run All after click
+            box["events"].append((time.time() - 3600, second_cell))
+            box["events"].append((time.time() + 3600, first_cell))
+            box["events"].append((time.time() + 3600, second_cell))
+        elif exec_input:
+            box["events"].append((time.time() + 3600, first_cell))
+            box["events"].append((time.time() + 3600, second_cell))
 
     kgl._iopub_listener = fake_listener
     kgl.time = types.SimpleNamespace(time=kgl.time.time,
@@ -1041,6 +1050,12 @@ def t_runall_full_paths():
     #    -> busy after click must verify (rc 0)
     _runall_scenario("first-run fresh busy", busy=True, exec_input=False,
                      first_run=True, want_rc=0, want_msg="fresh session busy")
+    # 6. a single pre-queued FIRST cell after the click is NOT a Run All
+    _runall_scenario("queued first cell only", exec_input="queued-first-only",
+                     want_rc=1)
+    # 7. pre-click noise must not pollute; proper post-click Run All passes
+    _runall_scenario("pre-click noise", exec_input="pre-noise",
+                     want_rc=0, want_msg="Run-All-shaped")
 
 
 t_runall_full_paths()
@@ -1113,7 +1128,8 @@ def t_listener_attribution():
                 break
             time.sleep(0.1)
         box["stop"]["v"] = True
-        check("only attributed execute_input recorded", len(box["events"]) == 1)
+        check("only attributed execute_input recorded", len(box["events"]) == 1
+              and isinstance(box["events"][0], tuple))
     finally:
         wsmod.create_connection = real_conn
 
