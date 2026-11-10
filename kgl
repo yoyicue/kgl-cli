@@ -616,10 +616,7 @@ def _headless_action(action, wait=30, timeout=240):
             #      one of this notebook's cells, arriving after the click.
             #      Residual: a Run All queued before our click in the same
             #      editor — externally indistinguishable, documented.
-            #   2. live-notebook execution_count vs a PRE-CLICK LIVE snapshot
-            #      (never the draft: it can lag live state or hold stale
-            #      counters from a previous kernel)
-            #   3. busy on the target kernel — ONLY when the session provably
+            #   2. busy on the target kernel — ONLY when the session provably
             #      did not exist before the click (fresh kernel starts idle).
             #      Unknown pre-click state => busy proves nothing.
             import threading
@@ -646,7 +643,11 @@ def _headless_action(action, wait=30, timeout=240):
                         args=(route, tgt, events, stop, cell_codes, js, rdy),
                         daemon=True)
                     listener.start()
-                    rdy.wait(8)  # subscription established before we rely on it
+                    if not rdy.wait(10) or not getattr(rdy, "_kgl_status", {}).get("ok"):
+                        print("WARNING: iopub subscription not established — "
+                              "verification limited (fast cells unverifiable)",
+                              file=sys.stderr, flush=True)
+                        listener = None  # not subscribed; allow no false comfort
 
             try:
                 kid0 = _notebook_kernel_id(required=False)
@@ -733,19 +734,11 @@ def _headless_action(action, wait=30, timeout=240):
                                                 and k.get("execution_state") == "busy"):
                                             print("run-all executing (fresh session busy)")
                                             return 0
-                                if pre_counts is not None:
-                                    _, cb = _fetch_json(
-                                        f"{route}/api/contents/__notebook_source__.ipynb?content=1")
-                                    live = (cb or {}).get("content") if isinstance(cb, dict) else None
-                                    if (isinstance(live, dict)
-                                            and _nb_max_exec(live) > pre_counts):
-                                        print("run-all executed (live counts advanced)")
-                                        return 0
                             except SystemExit:
                                 pass  # route mint flaky; keep polling
                     time.sleep(3)
-                reason = ("no causal evidence: matched editor execute_input / "
-                          "live-count advance / provably-fresh busy")
+                reason = ("no causal evidence: attributed execute_input / "
+                          "provably-fresh busy")
                 if session_existed is None:
                     reason += "; NOTE pre-click session state was unknown, so " \
                               "pre-existing busy could not be used as evidence"
@@ -855,25 +848,30 @@ def _fetch_json(url):
 
 def _iopub_listener(route, kernel_id, events, stop, cell_codes=None,
                     jupyter_session=None, ready=None):
-    """Record timestamps of execute_input messages on the target kernel that
-    come from the WEB EDITOR's jupyter session (header.session match) AND
-    whose code matches one of this notebook's cells. Association layers:
-    channel -> kernel, header.session -> the editor client, code -> this
-    notebook. Residual: a Run All queued before our click in the same editor.
-    `ready` is set once the websocket is subscribed (callers wait on it)."""
+    """Record timestamps of execute_input broadcasts on the target kernel that
+    originate from the WEB EDITOR's client. Per the jupyter message protocol,
+    a kernel-broadcast header.session identifies the KERNEL; the requesting
+    client appears in parent_header.session — which is what /api/sessions'
+    session id matches. Association layers: channel -> kernel,
+    parent_header.session -> the editor client, code -> this notebook's cells.
+    Residual: a Run All queued before our click in the same editor.
+    `ready` (Event) is set only with status["ok"] reflecting subscription."""
     import websocket
 
     def _txt(src):
         return "".join(src) if isinstance(src, list) else str(src or "")
 
     allow = {_txt(c) for c in (cell_codes or [])} or None
+    if ready is not None and not hasattr(ready, "_kgl_status"):
+        ready._kgl_status = {"ok": False}
     try:
         url = route.replace("https://", "wss://") + f"/api/kernels/{kernel_id}/channels"
         ws = websocket.create_connection(url, timeout=10, suppress_origin=False,
                                          origin=route)
         ws.settimeout(3)
         if ready is not None:
-            ready.set()  # subscribed; messages will now be observed
+            ready._kgl_status["ok"] = True  # subscribed
+            ready.set()
         while not stop["v"]:
             try:
                 m = json.loads(ws.recv())
@@ -884,16 +882,15 @@ def _iopub_listener(route, kernel_id, events, stop, cell_codes=None,
             mt = m.get("msg_type") or m.get("header", {}).get("msg_type")
             if mt != "execute_input":
                 continue
-            hdr = m.get("header") or {}
-            if jupyter_session and hdr.get("session") != jupyter_session:
-                continue  # a different client's request — not our run-all
+            # the ORIGINATING CLIENT lives in parent_header (kernel speaks
+            # in header; protocol docs: parent identifies the request source)
+            parent = m.get("parent_header") or {}
+            if jupyter_session and parent.get("session") != jupyter_session:
+                continue  # another client's request — not our run-all
             if allow is None or _txt((m.get("content") or {}).get("code")) in allow:
                 events.append(time.time())
     except Exception:
         return
-    finally:
-        if ready is not None:
-            ready.set()  # failed to connect: don't block the caller forever
 
 
 def _nb_max_exec(nb):

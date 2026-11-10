@@ -1074,17 +1074,21 @@ t_iopub_listener()
 def t_listener_attribution():
     import threading, websocket as wsmod
     msgs = iter([
-        # wrong client session -> ignored
+        # kernel speaks in header.session; originating client in parent_header
+        # wrong originating client -> ignored
         json.dumps({"msg_type": "execute_input",
-                    "header": {"session": "OTHER"},
+                    "header": {"session": "KERNEL"},
+                    "parent_header": {"session": "OTHER"},
                     "content": {"code": "print(1)"}}),
         # right client, right code -> recorded
         json.dumps({"msg_type": "execute_input",
-                    "header": {"session": "ED"},
+                    "header": {"session": "KERNEL"},
+                    "parent_header": {"session": "ED"},
                     "content": {"code": "print(1)"}}),
         # right client, foreign code -> ignored
         json.dumps({"msg_type": "execute_input",
-                    "header": {"session": "ED"},
+                    "header": {"session": "KERNEL"},
+                    "parent_header": {"session": "ED"},
                     "content": {"code": "import os; os.system('x')"}}),
     ])
     class FW:
@@ -1117,6 +1121,43 @@ def t_listener_attribution():
 
 
 t_listener_attribution()
+
+
+# --- listener ready semantics: success vs connection failure -----------------
+def t_listener_ready_semantics():
+    import threading, websocket as wsmod
+    real_conn = wsmod.create_connection
+
+    class OkW:
+        def settimeout(self, t): pass
+        def recv(self):
+            raise wsmod.WebSocketTimeoutException()
+        def close(self): pass
+
+    class FailConn:
+        def __init__(self, *a, **k): raise OSError("refused")
+
+    for fake, want_ok, name in [(lambda *a, **k: OkW(), True, "ok"),
+                                (lambda *a, **k: FailConn(), False, "conn-fail")]:
+        wsmod.create_connection = fake
+        try:
+            events, stop, rdy = [], {"v": False}, threading.Event()
+            th = threading.Thread(target=kgl._iopub_listener,
+                                  args=("https://r", "K", events, stop, None, None, rdy),
+                                  daemon=True)
+            th.start()
+            got = rdy.wait(2 if not want_ok else 5)
+            if want_ok:
+                check(f"ready[{name}] set", got)
+                check(f"ready[{name}] status ok", rdy._kgl_status["ok"] is True)
+            else:
+                check(f"ready[{name}] NOT set on failure", got is False)
+            stop["v"] = True
+        finally:
+            wsmod.create_connection = real_conn
+
+
+t_listener_ready_semantics()
 
 
 # --- 7. import side effects land in the sandboxed HOME ---------------------
