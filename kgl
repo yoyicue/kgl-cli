@@ -580,6 +580,17 @@ def _headless_action(action, wait=30, timeout=240):
                                                        timeout=30, suppress_origin=True)
             return None
 
+        def _iframe_ready():
+            """Editor's jupyter iframe target exists again after a reload."""
+            try:
+                tabs = json.loads(subprocess.check_output(
+                    ["curl", "-s", "--noproxy", "*", "-m", "3",
+                     f"http://localhost:{port}/json/list"]))
+                return any(t.get("type") == "iframe"
+                           and "jupyter-proxy" in t.get("url", "") for t in tabs)
+            except Exception:
+                return False
+
         def click(expr):
             pws = find_tab_ws()
             if not pws:
@@ -751,7 +762,15 @@ def _headless_action(action, wait=30, timeout=240):
                                                 pws0.close()
                                         except Exception:
                                             pass
-                                        time.sleep(12)
+                                        # wait for the editor's jupyter iframe
+                                        # to come back before clicking anywhere:
+                                        # a half-loaded page accepts the click
+                                        # as a NO-OP (learned the hard way)
+                                        for _ in range(30):
+                                            time.sleep(3)
+                                            if _iframe_ready():
+                                                time.sleep(5)  # settle
+                                                break
                                         listener["accepted"] = set(listener["clients"])
                             except SystemExit:
                                 pass  # best-effort pre-click snapshot
