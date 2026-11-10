@@ -584,11 +584,19 @@ def _headless_action(action, wait=30, timeout=240):
             return None
 
         sent_stop = {"v": False}
+        # shared buffer: the harvester runs INDEPENDENTLY of the kernel
+        # listener (which may attach much later on fresh sessions); frames
+        # seen before the listener exists are preserved here, and the
+        # listener's box references this same set
+        sent_ids = set()
+        harvester_started = [False]
 
         def _start_sent_harvester():
             """Attach CDP Network to the editor's jupyter iframe; every
             webSocketFrameSent payload's header.session is a client id OUR
-            page spoke for. Fills listener["sent"] (verdicts gate on it)."""
+            page spoke for. Idempotent; fills the shared sent_ids buffer."""
+            if harvester_started[0]:
+                return
             try:
                 tabs = json.loads(subprocess.check_output(
                     ["curl", "-s", "--noproxy", "*", "-m", "3",
@@ -597,6 +605,7 @@ def _headless_action(action, wait=30, timeout=240):
                            and "jupyter-proxy" in t.get("url", "")), None)
                 if not fr:
                     return
+                harvester_started[0] = True
                 import websocket as _ws
 
                 def run():
@@ -616,11 +625,12 @@ def _headless_action(action, wait=30, timeout=240):
                                     payload = json.loads(
                                         m["params"]["response"]["payloadData"])
                                     cid = (payload.get("header") or {}).get("session")
-                                    if cid and listener is not None:
-                                        listener["sent"].add(cid)
+                                    if cid:
+                                        sent_ids.add(cid)
                                 except Exception:
                                     pass
                     except Exception:
+                        harvester_started[0] = False  # allow a retry
                         return
                 threading.Thread(target=run, daemon=True).start()
             except Exception:
@@ -735,7 +745,7 @@ def _headless_action(action, wait=30, timeout=240):
                     return listener
                 box = {"events": [], "stop": {"v": False}, "ok": False,
                        "ready": threading.Event(),
-                       "clients": set(), "sent": set()}
+                       "clients": set(), "sent": sent_ids}  # SHARED buffer
                 threading.Thread(target=_iopub_listener,
                                  args=(route, tgt, box, cell_codes, js),
                                  daemon=True).start()
@@ -812,6 +822,11 @@ def _headless_action(action, wait=30, timeout=240):
                                 pass  # best-effort pre-click snapshot
             except SystemExit:
                 pass
+            # the harvester starts BEFORE the click in every scenario (the
+            # page's iframe exists once the editor loads, kernel or not);
+            # fresh-session frames buffered here survive until the listener
+            # attaches — nothing seen is ever dropped for ordering
+            _start_sent_harvester()
             t_click = time.time()
             r = click("(()=>{const b=[...document.querySelectorAll('button')]"
                       ".find(b=>/Run All/i.test(b.getAttribute('aria-label')||b.innerText));"
