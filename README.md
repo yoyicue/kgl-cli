@@ -47,8 +47,11 @@ kgl put local remote                # upload (auto-mkdir parents)
   common paths auto-detected) and `echo owner/slug > ~/.config/kgl/notebook`.
   These actions drive the Kaggle editor in an isolated headless chrome
   (ephemeral profile, auto-allocated CDP port) and verify the outcome
-  server-side before exiting. `run-all` exit 0 means execution was observed
-  with attribution: the editor's client id is LEARNED live from the kernel
+  server-side before exiting. `run-all` exit 0 means either CONFIRMED execution
+  (kernel-side attributed evidence; requires a confirmed CDP subscription)
+  or SUBMITTED (our page issued Run-All-shaped requests but no kernel
+  evidence arrived within the window — the message states which). See
+  VERIFICATION.md for the frozen spec. Exit 0 with attribution means: the editor's client id is LEARNED live from the kernel
   channel (Kaggle's editor uses a client id distinct from the REST session
   id — verified empirically), execute_input must match this notebook's
   cells, and the post-click sequence must be Run-All-shaped (starts at the

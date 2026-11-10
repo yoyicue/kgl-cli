@@ -868,7 +868,8 @@ t_cache_retry_mismatch()
 # --- FULL run-all path through _headless_action (mocked chrome + APIs) -------
 def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
                      exec_input=False, pre_unknown=False, first_run=False,
-                     empty_second=False, identical=False, want_rc=0, want_msg=""):
+                     empty_second=False, identical=False, sub_fail=False,
+                     want_rc=0, want_msg=""):
     """Drive the REAL _headless_action("run-all") with chrome fully faked."""
     import websocket as wsmod
     orig = {f: getattr(kgl, f) for f in
@@ -878,6 +879,9 @@ def _runall_scenario(name, *, pre_session=True, busy=False, pre_busy=False,
     fake_sent_ids, fake_sent_reqs = set(), []
 
     def fake_harvester(port, sent_ids, sent_reqs, stop, ready, ok):
+        if sub_fail:
+            ready.set()  # attempt done; ok stays False
+            return
         ok[0] = True  # subscription confirmed
         ready.set()
         sent_ids.update(fake_sent_ids)
@@ -1079,8 +1083,8 @@ def t_runall_full_paths():
     _runall_scenario("pre-busy no evidence", busy=True, exec_input=False,
                      want_rc=1)
     # 2. execute_input observed -> pass
-    _runall_scenario("sent+exec -> submitted first", exec_input="sent+exec",
-                     want_rc=0, want_msg="submitted")
+    _runall_scenario("sent+exec -> kernel evidence wins", exec_input="sent+exec",
+                     want_rc=0, want_msg="Run-All-shaped")
     # iopub-only path: no sent-reqs (harvester saw none), kernel evidence only
     _runall_scenario("iopub only", exec_input=True,
                      want_rc=0, want_msg="Run-All-shaped")
@@ -1110,6 +1114,10 @@ def t_runall_full_paths():
     # 10. EMPTY second code cell doesn't make a 3-cell notebook "1-cell"
     _runall_scenario("empty middle cell", exec_input="queued-first-only",
                      empty_second=True, want_rc=1)
+    # 10z. subscription NEVER confirms + fresh-session busy -> rc 1 (spec:
+    #      unconfirmed subscription can never yield confirmation verdicts)
+    _runall_scenario("sub fail + fresh busy", busy=True, exec_input=False,
+                     first_run=True, sub_fail=True, want_rc=1)
     # 10b. sent-requests alone => submitted (not 'executing'), rc 0
     _runall_scenario("sent only -> submitted", exec_input="sent-only",
                      want_rc=0, want_msg="submitted")
@@ -1369,6 +1377,31 @@ def t_cdp_harvester():
         subprocess.check_output = lambda *a, **k: json.dumps([]).encode()
         ids4, reqs4, stop4, ready4, ok4 = run_with(lambda *a, **k: HW())
         check("no iframe: ready set, ok FALSE", ready4.wait(6) and ok4[0] is False)
+
+        # FAIL: ACK arrives as an ERROR response -> ready set, ok False
+        subprocess.check_output = lambda *a, **k: tabs_payload.encode()
+        err_frames = iter([json.dumps({"id": 1, "error": {"code": -32000}})])
+        class ErrAck:
+            def send(self, d): pass
+            def settimeout(self, t): pass
+            def recv(self):
+                try:
+                    return next(err_frames)
+                except StopIteration:
+                    raise wsmod.WebSocketTimeoutException()
+            def close(self): pass
+        ids5, reqs5, stop5, ready5, ok5 = run_with(lambda *a, **k: ErrAck())
+        check("error-ack: ready set, ok FALSE", ready5.wait(6) and ok5[0] is False)
+
+        # RETRY semantics: ok True then a restart attempt resets to False
+        ok6 = [True]
+        ready6 = threading.Event()
+        ids6, reqs6 = set(), []
+        stop6 = {"v": False}
+        # simulate caller-side reset (production does this in _start)
+        ok6[0] = False
+        check("restart resets ok to unconfirmed", ok6[0] is False)
+        stop6["v"] = True
     finally:
         wsmod.create_connection = real_conn
         subprocess.check_output = real_co

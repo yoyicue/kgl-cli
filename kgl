@@ -599,6 +599,7 @@ def _headless_action(action, wait=30, timeout=240):
             if harvester_on[0]:
                 return harvester_ok[0]
             harvester_on[0] = True
+            harvester_ok[0] = False  # a retry starts from unconfirmed
             harvester_ready.clear()
 
             def run():
@@ -859,29 +860,17 @@ def _headless_action(action, wait=30, timeout=240):
                                     _start_sent_harvester()  # page frames first
                                     _attach_listener(route,
                                                      ent.get("kernel", {}).get("id"), jsess)
-                                if session_existed is False:
-                                    # provably fresh kernel: busy here IS our click
+                                if session_existed is False and harvester_confirmed:
+                                    # provably fresh kernel: busy here IS our
+                                    # click — but only with a CONFIRMED
+                                    # subscription (spec: unconfirmed => rc 1)
                                     for k in kbody:
                                         if (k.get("id") == ent.get("kernel", {}).get("id")
                                                 and k.get("execution_state") == "busy"):
                                             print("run-all executing (fresh session busy)")
                                             return 0
-                                # STRONGEST evidence first: execute_requests
-                                # OUR PAGE ISSUED after the click (harvested
-                                # from CDP sent frames — independent of the
-                                # kernel listener, covers cells that finish
-                                # before the listener attaches)
-                                reqs = [c for ts, c in sent_reqs if ts > t_click]
-                                if first_cell_code is not None and reqs \
-                                   and reqs[0] == first_cell_code:
-                                    second = (_txt(cell_codes[1])
-                                              if len(cell_codes or []) > 1
-                                              and cell_codes[1] else None)
-                                    if second is None or second in reqs[1:]:
-                                        print("run-all submitted (our page issued "
-                                              "Run-All-shaped requests; execution "
-                                              "unconfirmed — no kernel evidence)")
-                                        return 0
+                                # KERNEL-side evidence only here (spec):
+                                # confirmation requires a confirmed subscription
                                 # Run-All shape verdict (ent + kbody at hand):
                                 # post-click stream STARTS at the first code cell,
                                 # then either reaches the SECOND cell as a
@@ -891,7 +880,8 @@ def _headless_action(action, wait=30, timeout=240):
                                 # not time out mid-execution). A single queued
                                 # cell that finished, even the first, does not pass.
                                 if (listener is not None and listener["events"]
-                                        and first_cell_code is not None):
+                                        and first_cell_code is not None
+                                        and harvester_confirmed):
                                     post = _post_events(listener, t_click)
                                     if post and post[0] == first_cell_code:
                                         second = (_txt(cell_codes[1])
@@ -920,6 +910,19 @@ def _headless_action(action, wait=30, timeout=240):
                             except SystemExit:
                                 pass  # route mint flaky; keep polling
                     time.sleep(3)
+                reqs = [c for ts, c in sent_reqs if ts > t_click]
+                if first_cell_code is not None and reqs \
+                   and reqs[0] == first_cell_code:
+                    second = (_txt(cell_codes[1])
+                              if len(cell_codes or []) > 1
+                              and cell_codes[1] else None)
+                    if second is None or second in reqs[1:]:
+                        # window expired with no KERNEL evidence: our page did
+                        # submit Run-All-shaped requests (spec: submitted)
+                        print("run-all submitted (our page issued Run-All-"
+                              "shaped requests; execution unconfirmed — no "
+                              "kernel evidence within the window)")
+                        return 0
                 reason = ("no causal evidence: attributed execute_input / "
                           "provably-fresh busy")
                 if session_existed is None:
@@ -1058,8 +1061,10 @@ def _cdp_sent_harvester(port, sent_ids, sent_reqs, stop, ready, ok):
         while time.time() - t0 < 5:
             try:
                 m = json.loads(hws.recv())
-                if m.get("id") == 1:
+                if m.get("id") == 1 and "error" not in m:
                     acked = True
+                    break
+                if m.get("id") == 1:  # error response: NOT confirmed
                     break
             except websocket.WebSocketTimeoutException:
                 break
@@ -1068,6 +1073,8 @@ def _cdp_sent_harvester(port, sent_ids, sent_reqs, stop, ready, ok):
                 return
         if acked:
             ok[0] = True  # subscription CONFIRMED — the only ok path
+        else:
+            hws.close()  # half-subscribed is useless; let a retry start clean
         ready.set()
         hws.settimeout(10)
         while not stop["v"]:
