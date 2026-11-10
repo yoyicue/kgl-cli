@@ -454,10 +454,13 @@ def ws_connect(url, origin=None):
             return websocket.create_connection(url, timeout=15, **kw)
         except Exception as e:
             last = e
-    # fallback: explicit proxy (Surge on this machine)
-    for ph, pp in (("127.0.0.1", 6152),):
+    # fallback: explicit proxy IF the user configured one (KGL_PROXY=host:port).
+    # No hardcoded defaults — a stray local proxy must never intercept traffic.
+    proxy = os.environ.get("KGL_PROXY", "")
+    if proxy and ":" in proxy:
+        ph, _, pp = proxy.partition(":")
         try:
-            kw = dict(http_proxy_host=ph, http_proxy_port=pp)
+            kw = dict(http_proxy_host=ph, http_proxy_port=int(pp))
             if origin:
                 kw.update(suppress_origin=False, origin=origin)
             else:
@@ -762,6 +765,7 @@ def _headless_action(action, wait=30, timeout=240):
                                                 pws0.close()
                                         except Exception:
                                             pass
+                                        before = set(listener["clients"])
                                         # wait for the editor's jupyter iframe
                                         # to come back before clicking anywhere:
                                         # a half-loaded page accepts the click
@@ -771,7 +775,12 @@ def _headless_action(action, wait=30, timeout=240):
                                             if _iframe_ready():
                                                 time.sleep(5)  # settle
                                                 break
-                                        listener["accepted"] = set(listener["clients"])
+                                        # DELTA attribution: only the client that
+                                        # (RE)connected at OUR reload is this
+                                        # page's editor; ids already live before
+                                        # the reload are OTHER clients
+                                        listener["accepted"] = (
+                                            set(listener["clients"]) - before)
                             except SystemExit:
                                 pass  # best-effort pre-click snapshot
             except SystemExit:
@@ -823,6 +832,11 @@ def _headless_action(action, wait=30, timeout=240):
                                             first_cell_code = _txt(cell_codes[0])
                                     _attach_listener(route,
                                                      ent.get("kernel", {}).get("id"), jsess)
+                                    if listener is not None and not listener["accepted"]:
+                                        # brand-new kernel: every client that
+                                        # connects now is THIS page's editor
+                                        time.sleep(6)
+                                        listener["accepted"] = set(listener["clients"])
                                 if session_existed is False:
                                     # provably fresh kernel: busy here IS our click
                                     for k in kbody:

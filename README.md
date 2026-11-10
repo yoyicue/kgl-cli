@@ -20,8 +20,14 @@ kaggle cookies ─▶ GetFirebaseAuthToken ─▶ signInWithCustomToken (kkb-pro
 
 ```bash
 ln -s ~/kgl/kgl ~/.local/bin/kgl
-pip3 install --user --break-system-packages websocket-client   # only dep
+# kgl runs under /usr/bin/python3 (the shebang) — install deps for THAT one:
+/usr/bin/python3 -m pip install --user websocket-client        # only dep
+/usr/bin/python3 test_kgl.py                                    # offline tests
 ```
+
+If direct WebSocket connections fail on your network (some TLS-intercepting
+middleboxes break them), export an explicit HTTP proxy:
+`export KGL_PROXY=127.0.0.1:6152` — kgl never proxies unless you set this.
 
 ## Usage
 
