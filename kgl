@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """kgl - control Kaggle notebook sandbox (Jupyter) from local terminal."""
 import base64, json, os, subprocess, sys, time, uuid
 from urllib.parse import quote
@@ -443,18 +443,36 @@ def pick_kernel_id():
              "\n".join(f'  {s["kernel"]["id"]}  {s.get("path")}' for s in sessions))
 
 
+def ws_connect(url, origin=None):
+    """WebSocket connect with an explicit-proxy fallback: the local TUN
+    path breaks python TLS to some hosts while the HTTP proxy path works."""
+    import websocket
+    last = None
+    for kw in ({"suppress_origin": False, "origin": origin} if origin
+               else {"suppress_origin": True},):
+        try:
+            return websocket.create_connection(url, timeout=15, **kw)
+        except Exception as e:
+            last = e
+    # fallback: explicit proxy (Surge on this machine)
+    for ph, pp in (("127.0.0.1", 6152),):
+        try:
+            kw = dict(http_proxy_host=ph, http_proxy_port=pp)
+            if origin:
+                kw.update(suppress_origin=False, origin=origin)
+            else:
+                kw.update(suppress_origin=True)
+            return websocket.create_connection(url, timeout=15, **kw)
+        except Exception as e:
+            last = e
+    raise last
+
+
 def ws_kernel(kernel_id=None):
     import websocket
     kid = kernel_id or pick_kernel_id()
     url = base().replace("https://", "wss://") + f"/api/kernels/{kid}/channels"
-    # ponytail: local proxy route is flaky; 3 attempts
-    for i in range(3):
-        try:
-            return websocket.create_connection(url, timeout=15, suppress_origin=False, origin=base())
-        except Exception as e:
-            if i == 2:
-                raise
-            time.sleep(1)
+    return ws_connect(url, origin=base())
 
 
 def run_code(code, timeout=600, kernel_id=None):
@@ -659,7 +677,8 @@ def _headless_action(action, wait=30, timeout=240):
                 if listener is not None:
                     return listener
                 box = {"events": [], "stop": {"v": False}, "ok": False,
-                       "ready": threading.Event()}
+                       "ready": threading.Event(),
+                       "clients": set(), "accepted": set()}
                 threading.Thread(target=_iopub_listener,
                                  args=(route, tgt, box, cell_codes, js),
                                  daemon=True).start()
@@ -719,6 +738,21 @@ def _headless_action(action, wait=30, timeout=240):
                                 if ent:
                                     _attach_listener(route0,
                                                      ent.get("kernel", {}).get("id"), jsess)
+                                    if listener is not None:
+                                        # force the editor to RE-connect: its
+                                        # handshake (kernel_info) reveals the
+                                        # editor client id, which (empirically)
+                                        # is NOT the REST session id
+                                        try:
+                                            pws0 = find_tab_ws()
+                                            if pws0:
+                                                pws0.send(json.dumps(
+                                                    {"id": 9, "method": "Page.reload"}))
+                                                pws0.close()
+                                        except Exception:
+                                            pass
+                                        time.sleep(12)
+                                        listener["accepted"] = set(listener["clients"])
                             except SystemExit:
                                 pass  # best-effort pre-click snapshot
             except SystemExit:
@@ -927,32 +961,25 @@ def _fetch_json(url):
 
 
 def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None):
-    """Subscribe to the target kernel's iopub and record ATTRIBUTED
-    execute_input timestamps into box["events"].
-
-    Attribution requires BOTH the originating-client id (parent_header.session
-    per the message protocol — NOT header.session, which identifies the
-    kernel) and the notebook's cell codes. If either is unknown, nothing is
-    recorded: absence of attribution information means UNCONFIRMED, never
-    accept-any-execution.
-
-    box: {"events": [], "stop": {"v": bool}, "ok": bool, "ready": Event}.
-    ready is set once the outcome is decided; ok=True only on successful
-    subscription. A cancelled box (stop set by the caller after a failed
-    handshake) may still connect late — its events are never consulted."""
+    """Subscribe to the target kernel's channels. Harvests every DISTINCT
+    client id seen in parent_header (any message: the editor's connect-time
+    kernel_info request included — empirically, Kaggle's editor client id is
+    NOT the REST session id, so it must be LEARNED). Records attributed
+    execute_input (ts, code) pairs: attribution = parent in the accepted set
+    (ids observed before the click snapshot) and code in this notebook's cells.
+    box: {"events", "stop", "ok", "ready", "clients": set, "accepted": set}."""
     import websocket
 
     def _txt(src):
         return "".join(src) if isinstance(src, list) else str(src or "")
 
-    if not cell_codes or not jupyter_session:
+    if not cell_codes:
         box["ready"].set()  # cannot attribute anything; caller sees ok=False
         return
     allow = {_txt(c) for c in cell_codes}
     try:
         url = route.replace("https://", "wss://") + f"/api/kernels/{kernel_id}/channels"
-        ws = websocket.create_connection(url, timeout=10, suppress_origin=False,
-                                         origin=route)
+        ws = ws_connect(url, origin=route)
         ws.settimeout(3)
         box["ok"] = True
         box["ready"].set()
@@ -963,20 +990,20 @@ def _iopub_listener(route, kernel_id, box, cell_codes=None, jupyter_session=None
                 continue
             except Exception:
                 return
+            parent = (m.get("parent_header") or {}).get("session")
+            if parent:
+                box["clients"].add(parent)  # learn every connected client
             mt = m.get("msg_type") or m.get("header", {}).get("msg_type")
             if mt != "execute_input":
                 continue
-            parent = m.get("parent_header") or {}
-            if parent.get("session") != jupyter_session:
-                continue  # another client's request
-            code = _txt((m.get("content") or {}).get("code"))
-            if code in allow:
-                # (ts, code) pairs: verdicts filter by click time AND judge
-                # the SEQUENCE of post-click codes, never the listener's
-                # first-ever message
-                box["events"].append((time.time(), code))
+            accepted = box["accepted"] or ({jupyter_session} if jupyter_session else set())
+            if parent not in accepted:
+                continue  # a client we hadn't seen before the click
+            if _txt((m.get("content") or {}).get("code")) in allow:
+                box["events"].append((time.time(),
+                                      _txt((m.get("content") or {}).get("code"))))
     except Exception:
-        box["ready"].set()  # failed to connect; ok stays False
+        box["ready"].set()  # failed; ok stays False
         return
 
 

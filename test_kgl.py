@@ -1126,51 +1126,68 @@ t_runall_causal_signals()
 # --- _iopub_listener records execute_input only -------------------------------
 
 
-# --- listener: parent_header attribution (box contract) ---------------------
+# --- listener: client learning + accepted-set attribution --------------------
 def t_listener_attribution():
     import threading, websocket as wsmod
     msgs = iter([
-        # wrong originating client (parent_header) -> ignored
+        # editor handshake (kernel_info reply) reveals its client id
+        json.dumps({"msg_type": "kernel_info_reply",
+                    "header": {"session": "KERNEL"},
+                    "parent_header": {"session": "ED"}}),
+        # execute_input from a client NOT accepted (appeared post-snapshot)
         json.dumps({"msg_type": "execute_input",
                     "header": {"session": "KERNEL"},
                     "parent_header": {"session": "OTHER"},
                     "content": {"code": "print(1)"}}),
-        # right client, right code -> recorded
+        # accepted client + right code -> recorded
         json.dumps({"msg_type": "execute_input",
                     "header": {"session": "KERNEL"},
                     "parent_header": {"session": "ED"},
                     "content": {"code": "print(1)"}}),
-        # right client, foreign code -> ignored
+        # accepted client, foreign code -> ignored
         json.dumps({"msg_type": "execute_input",
                     "header": {"session": "KERNEL"},
                     "parent_header": {"session": "ED"},
                     "content": {"code": "import os"}}),
     ])
+    import queue as _q
+    q = _q.Queue()
+    for m in msgs:
+        q.put(m)
     class FW:
         def settimeout(self, t): pass
         def recv(self):
+            time.sleep(0.15)  # pace messages so the snapshot lands between
             try:
-                return next(msgs)
-            except StopIteration:
+                return q.get(timeout=0.5)
+            except Exception:
                 raise wsmod.WebSocketTimeoutException()
         def close(self): pass
     real_conn = wsmod.create_connection
     wsmod.create_connection = lambda *a, **k: FW()
     try:
         box = {"events": [], "stop": {"v": False}, "ok": False,
-               "ready": threading.Event()}
+               "ready": threading.Event(), "clients": set(), "accepted": set()}
         th = threading.Thread(target=kgl._iopub_listener,
-                              args=("https://r", "K", box, ["print(1)"], "ED"),
+                              args=("https://r", "K", box, ["print(1)"], None),
                               daemon=True)
         th.start()
         check("box ready + ok", box["ready"].wait(5) and box["ok"])
+        # snapshot the learned clients as 'accepted' (the click moment)
         for _ in range(50):
-            if box["events"]:
+            if "ED" in box["clients"]:
                 break
             time.sleep(0.1)
+        box["accepted"] = set(box["clients"])  # BEFORE the OTHER client appears
+        for _ in range(60):
+            if box["events"]:
+                break
+            time.sleep(0.15)
         box["stop"]["v"] = True
-        check("only attributed execute_input recorded", len(box["events"]) == 1
-              and isinstance(box["events"][0], tuple))
+        check("editor client learned", "ED" in box["clients"])
+        check("only accepted+matching execute_input recorded",
+              len(box["events"]) == 1 and box["events"][0][1] == "print(1)",
+              f"events={box['events']} clients={box['clients']}")
     finally:
         wsmod.create_connection = real_conn
 
@@ -1189,16 +1206,16 @@ def t_listener_no_attribution_info():
     real_conn = wsmod.create_connection
     wsmod.create_connection = lambda *a, **k: FW()
     try:
-        for cc, js in [(None, "ED"), (["x"], None), (None, None)]:
+        for cc, js in [(None, "ED"), (None, None)]:
             box = {"events": [], "stop": {"v": False}, "ok": False,
-                   "ready": threading.Event()}
+                   "ready": threading.Event(), "clients": set(), "accepted": set()}
             th = threading.Thread(target=kgl._iopub_listener,
                                   args=("https://r", "K", box, cc, js),
                                   daemon=True)
             th.start()
             box["ready"].wait(5)
             box["stop"]["v"] = True
-            check(f"no attribution info ({bool(cc)},{bool(js)}) -> not ok, no events",
+            check(f"no cells ({bool(cc)},{bool(js)}) -> not ok, no events",
                   box["ok"] is False and box["events"] == [])
     finally:
         wsmod.create_connection = real_conn
