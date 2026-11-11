@@ -239,8 +239,10 @@ def _select_session(sessions, which):
     return cand[0]
 
 
-FB_KEY = "AIzaSyD83TRC5oxzFh-vaPb_4X2tHBigTcgkD0Y"  # kkb-production web key
 FS_BASE = "https://firestore.googleapis.com/v1/projects/kkb-production/databases/(default)/documents"
+# NOTE: the firebase WEB key is fetched at runtime from Kaggle's public
+# GetFirebaseConfig endpoint (it is a public browser key shipped in their
+# frontend JS, not a secret — but we keep no key literals in the repo)
 
 
 def _fb_session(which=None, quiet=False):
@@ -266,6 +268,7 @@ def _fb_session(which=None, quiet=False):
     if not quiet:
         print(f"session: {run['title']} (kernelRunId {run['kernelRunId']})")
 
+    FB_KEY = kgl_api("GetFirebaseConfig")["apiKey"]  # public browser key
     tok = kgl_api("GetFirebaseAuthToken")["authToken"]
     code, out = _post_json(
         f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={FB_KEY}",
